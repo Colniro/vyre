@@ -79,6 +79,8 @@ pub struct EdgeRuntime {
     env: Rc<RefCell<EnvState>>,
     parent: HWND,
     dir: PathBuf,
+    /// Privates Fenster: Tabs im InPrivate-Modus (nichts wird gespeichert).
+    private: bool,
 }
 
 fn hwnd(window: &Window) -> HWND {
@@ -94,9 +96,9 @@ fn read(f: impl FnOnce(*mut PWSTR) -> windows::core::Result<()>) -> String {
 }
 
 impl EdgeRuntime {
-    pub fn new(shared: Rc<EdgeShared>, dir: PathBuf) -> Self {
+    pub fn new(shared: Rc<EdgeShared>, dir: PathBuf, private: bool) -> Self {
         let parent = hwnd(&shared.main);
-        Self { shared, env: Rc::new(RefCell::new(EnvState::None)), parent, dir }
+        Self { shared, env: Rc::new(RefCell::new(EnvState::None)), parent, dir, private }
     }
 
     pub fn failed(&self) -> bool {
@@ -198,6 +200,7 @@ impl EdgeRuntime {
         let view = EdgeView { state: state.clone(), inner: inner.clone() };
         let shared = self.shared.clone();
         let parent = self.parent;
+        let private = self.private;
         self.with_env(move |env| {
             let env2 = env.clone();
             let handler = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(move |result, controller| {
@@ -215,7 +218,17 @@ impl EdgeRuntime {
                 Ok(())
             }));
             // SAFETY: Hauptfenster-Handle ist gültig, solange Vyre läuft.
-            if let Err(e) = unsafe { env.CreateCoreWebView2Controller(parent, &handler) } {
+            let created = unsafe {
+                match env.cast::<ICoreWebView2Environment10>().ok().filter(|_| private) {
+                    // Privat: InPrivate-Profil, das beim Schließen verworfen wird.
+                    Some(env10) => env10.CreateCoreWebView2ControllerOptions().and_then(|options| {
+                        options.SetIsInPrivateModeEnabled(true)?;
+                        env10.CreateCoreWebView2ControllerWithOptions(parent, &options, &handler)
+                    }),
+                    None => env.CreateCoreWebView2Controller(parent, &handler),
+                }
+            };
+            if let Err(e) = created {
                 log::error!("WebView2-Tab: {e}");
             }
         });

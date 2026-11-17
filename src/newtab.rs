@@ -41,6 +41,8 @@ pub struct VyreProtocol {
     downloads: Option<Downloads>,
     /// Pausieren/Fortsetzen/Abbrechen über das Hauptprogramm (WebView2-Downloads).
     download_op: Option<Box<dyn Fn(u64, String) + Send + Sync>>,
+    /// Privates Fenster: Hinweis auf der Neuer-Tab-Seite.
+    private: bool,
     token: String,
 }
 
@@ -63,7 +65,13 @@ impl VyreProtocol {
             import: Some(Box::new(import)),
             downloads: Some(downloads),
             download_op: Some(Box::new(download_op)),
+            private: false,
             token: format!("{a:016x}{:016x}", h.finish()) }
+    }
+
+    pub fn with_private(private: bool, mut me: Self) -> Self {
+        me.private = private;
+        me
     }
 
     /// Erzeugt das HTML für eine `vyre://`-Adresse.
@@ -512,6 +520,7 @@ document.querySelectorAll(".actions button").forEach(function (b) {{
 <body>
 <main>
   <div class="logo">Vyre</div>
+  {private_note}
   <form id="search" autocomplete="off">
     <input id="q" name="q" placeholder="Mit {engine} suchen oder !Bang eingeben (!yt, !w, !gh …)">
   </form>
@@ -569,6 +578,13 @@ form.addEventListener("submit", function (e) {{
 </body></html>"##,
             engine = esc(engine.name),
             chooser_hidden = if first_start { "" } else { " hidden" },
+            private_note = if self.private {
+                r#"<div class="private-note"><b>Privates Fenster.</b> Verlauf, Cookies, Formulardaten und Seitenspeicher
+                werden nicht gespeichert und sind beim Schließen weg. Heruntergeladene Dateien und Favoriten bleiben erhalten.
+                Dein Internetanbieter und die besuchten Seiten sehen trotzdem, dass du da warst.</div>"#
+            } else {
+                ""
+            },
             chooser_title = if first_start { "Willkommen bei Vyre! Welche Suchmaschine möchtest du nutzen?" } else { "Suchmaschine wählen" },
             token_js = crate::engine::js_string(token),
         )
@@ -675,6 +691,9 @@ h2 { margin: 0; font-size: 21px; font-weight: 600; }
 .engine span { color: #8a8a9c; font-size: 13px; }
 .engine:hover { border-color: #9d8cff; }
 .engine.chosen { border-color: #9d8cff; background: #343248; }
+.private-note { max-width: 560px; margin: -12px 0 24px; padding: 12px 16px; border-radius: 12px; background: #29203a;
+  color: #d8cff0; font-size: 13.5px; line-height: 1.5; text-align: center; }
+.private-note b { color: #c48cff; }
 /* Kreuz aus zwei gedrehten Strichen: sitzt unabhängig von der Schrift genau in der Mitte. */
 .x, .del { padding: 0; font-size: 0; }
 .x::before, .x::after, .del::before, .del::after { content: ""; position: absolute; left: 50%; top: 50%;
@@ -719,6 +738,7 @@ mod tests {
             import: None,
             downloads: None,
             download_op: None,
+            private: false,
             token: "geheim".into(),
         }
     }

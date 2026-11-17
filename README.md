@@ -27,6 +27,7 @@ Der erste Build dauert lange, weil Servo mitgebaut wird. SpiderMonkey wird ferti
 | Strg+B | Seitenleiste: fest ↔ beim Hovern ausfahren |
 | Strg+D | Seite als Favorit anpinnen / lösen |
 | Strg+S | Aktuelle Seite/Datei herunterladen |
+| Strg+Umschalt+N | Privates Fenster |
 | Strg+Umschalt+E | Engine des Tabs wechseln (Servo ↔ WebView2) |
 | Strg+Umschalt+Z | Aktiven Tab schlafen legen |
 | Strg+H, Strg+Umschalt+Entf | Verlauf |
@@ -138,6 +139,18 @@ Die gelernten und festgelegten Seiten stehen in `%LOCALAPPDATA%\Vyre\engine-seit
   Bitwarden, 1Password, KeePass …). Neuere Chrome-Versionen schützen manche Passwörter
   zusätzlich so, dass nur Chrome selbst sie lesen kann – die meldet der Import, dafür gibt es
   den CSV-Weg. Firefox/Zen mit Hauptpasswort: ebenfalls über CSV.
+
+## Privates Fenster
+
+Strg+Umschalt+N oder „Privates Fenster“ unter „+ Neuer Tab“ startet ein eigenes Vyre-Fenster
+(eigener Prozess, `vyre.exe --privat`) in dunklem Lila mit „PRIVAT · TABS“:
+
+- Servo ohne Profilordner (alles nur im Speicher), WebView2-Tabs im InPrivate-Modus.
+- Kein Verlauf, keine Sitzung, keine gelernten Engine-Seiten; der vorhandene Verlauf dient
+  nur für Vorschläge.
+- Gespeicherte Passwörter werden ausgefüllt, neue nicht gespeichert.
+- Downloads bleiben im Ordner, erscheinen aber nicht in der Download-Liste.
+- Favoriten anpinnen geht (bewusste Aktion) und bleibt erhalten.
 
 ## Downloads
 

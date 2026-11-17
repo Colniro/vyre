@@ -658,6 +658,7 @@ impl ServoEngine {
         history: Arc<Store>,
         settings: settings::Shared,
         downloads: Downloads,
+        private: bool,
     ) -> Result<Self, String> {
         // Zwei Servo-Fenster: eines für normale Tabs, das zweite für die zweite Hälfte einer
         // geteilten Ansicht, wenn beide Hälften Servo-Seiten sind.
@@ -670,8 +671,10 @@ impl ServoEngine {
             log::warn!("Profilordner {} nicht anlegbar: {e}", profile.display());
         }
         let vyre_dir = profile.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        // Privat: kein Profilordner, alles nur im Speicher.
         let opts = Opts {
-            config_dir: Some(profile),
+            config_dir: (!private).then_some(profile),
+            temporary_storage: private,
             // Ein Absturz in einer Seite soll nicht den ganzen Browser beenden.
             hard_fail: false,
             ..Default::default()
@@ -703,13 +706,20 @@ impl ServoEngine {
                 events: RefCell::default(),
             }),
             vyre_dir.join("WebView2"),
+            private,
         );
         let shared = Rc::new(Shared {
             surfaces: vec![first, second],
             main,
             blocker,
             history,
-            sites: Rc::new(RefCell::new(Sites::load(&sites::path()))),
+            sites: Rc::new(RefCell::new({
+                let mut sites = Sites::load(&sites::path());
+                if private {
+                    sites.read_only();
+                }
+                sites
+            })),
             opened: RefCell::default(),
             closed: RefCell::default(),
             pending_css: RefCell::default(),

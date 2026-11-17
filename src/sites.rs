@@ -115,6 +115,11 @@ impl Sites {
         t
     }
 
+    /// Privates Fenster: nichts über besuchte Seiten in die Datei schreiben.
+    pub fn read_only(&mut self) {
+        self.path = None;
+    }
+
     fn save(&self) {
         if let Some(p) = &self.path {
             if let Err(e) = std::fs::write(p, self.to_text()) {

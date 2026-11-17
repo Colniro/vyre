@@ -38,6 +38,19 @@ pub const THEME: Theme = Theme {
     close: Rgba::rgb(0xc4, 0x2b, 0x1c),
 };
 
+/// Farben des privaten Fensters: dunkles Lila, damit man es sofort erkennt.
+pub const PRIVATE_THEME: Theme = Theme {
+    bg: Rgba::rgb(0x1b, 0x13, 0x26),
+    surface: Rgba::rgb(0x29, 0x1e, 0x38),
+    hover: Rgba::rgb(0x36, 0x28, 0x49),
+    active: Rgba::rgb(0x47, 0x33, 0x63),
+    text: Rgba::rgb(0xee, 0xe8, 0xf6),
+    dim: Rgba::rgb(0x9a, 0x8c, 0xae),
+    accent: Rgba::rgb(0xc4, 0x8c, 0xff),
+    selection: Rgba(0xc4, 0x8c, 0xff, 0x60),
+    close: Rgba::rgb(0xc4, 0x2b, 0x1c),
+};
+
 /// Breite der Seitenleiste in logischen Pixeln.
 const SIDEBAR_W: f32 = 264.0;
 /// Abstand des Seiteninhalts zum Fensterrand.
@@ -117,6 +130,8 @@ pub enum Hit {
     PwSave,
     PwNever,
     PwDismiss,
+    /// "Privates Fenster" unter "Neuer Tab".
+    NewPrivate,
     /// Download unten in der Seitenleiste (öffnet vyre://downloads) und sein Schließen-Kreuz.
     Download(usize),
     DownloadClose(usize),
@@ -189,6 +204,7 @@ pub struct Layout {
     row_w: f32,
     first_row_y: f32,
     pub new_tab: Rect,
+    pub new_private: Option<Rect>,
     pub content: Rect,
     pub fps: Rect,
 }
@@ -203,6 +219,8 @@ pub struct Counts {
     pub prompt: bool,
     /// Downloads unten in der Seitenleiste.
     pub downloads: usize,
+    /// Zeile "Privates Fenster" anzeigen (nicht im privaten Fenster selbst).
+    pub private_button: bool,
 }
 
 const FAVS_PER_ROW: usize = 6;
@@ -311,6 +329,7 @@ impl Layout {
             rows: (0..tab_count).map(|i| (Row::Single(i), row(i))).collect(),
             tabs,
             new_tab,
+            new_private: counts.private_button.then(|| Rect { y: new_tab.y + (TAB_H + TAB_SPACING) * s, ..new_tab }),
             content,
             panes: None,
             divider: None,
@@ -346,6 +365,9 @@ impl Layout {
             }
             self.tabs = tabs;
             self.new_tab = Rect { x: self.row_x, y: self.first_row_y + rows.len() as f32 * step, w: self.row_w, h: TAB_H * s };
+            if let Some(p) = &mut self.new_private {
+                p.y = self.new_tab.y + step;
+            }
         }
         let c = self.content;
         if let Some(right) = drop {
@@ -436,6 +458,9 @@ impl Layout {
             }
             if self.new_tab.contains(x, y) {
                 return Hit::NewTab;
+            }
+            if self.new_private.is_some_and(|r| r.contains(x, y)) {
+                return Hit::NewPrivate;
             }
             for (i, r) in self.downloads.iter().enumerate() {
                 if r.contains(x, y) {
@@ -673,6 +698,7 @@ const ICON_CLOSE: &str = "\u{E8BB}";
 const ICON_LOCK: &str = "\u{E72E}";
 const ICON_GLOBE: &str = "\u{E774}";
 const ICON_ADD: &str = "\u{E710}";
+const ICON_PRIVATE: &str = "\u{E727}";
 const ICON_WARNING: &str = "\u{E7BA}";
 const ICON_SHIELD: &str = "\u{EA18}";
 const ICON_STAR: &str = "\u{E734}";
@@ -744,6 +770,11 @@ pub struct Ui {
     tab_labels: Vec<TabLabels>,
     new_tab_icon: Label,
     new_tab_label: Label,
+    private_icon: Label,
+    private_label: Label,
+    /// Farben: normal oder privat.
+    theme: &'static Theme,
+    pub private: bool,
     fps_label: Label,
     /// Horizontales Verschieben des URL-Textes, damit der Cursor sichtbar bleibt.
     url_scroll: f32,
@@ -836,12 +867,26 @@ impl Ui {
             tab_labels: Vec::new(),
             new_tab_icon: Label::new(fs),
             new_tab_label: Label::new(fs),
+            private_icon: Label::new(fs),
+            private_label: Label::new(fs),
+            theme: &THEME,
+            private: false,
             fps_label: Label::new(fs),
             ui_family,
             icon_family,
             url_scroll: 0.0,
             show_fps: true,
         }
+    }
+
+    /// Schaltet auf die Farben des privaten Fensters.
+    pub fn set_private(&mut self, private: bool) {
+        self.private = private;
+        self.theme = if private { &PRIVATE_THEME } else { &THEME };
+    }
+
+    pub fn theme(&self) -> &'static Theme {
+        self.theme
     }
 
     /// Hover-Wert (0..1) eines Knopfes.
@@ -918,7 +963,7 @@ impl Ui {
         stats: &Stats,
     ) -> Frame<'a> {
         let s = layout.scale;
-        let t = &THEME;
+        let t = self.theme;
         let page = tabs.tabs.get(tabs.active).cloned().unwrap_or_default();
         let mut cards = Vec::new();
         let mut under = Vec::new();
@@ -1104,7 +1149,15 @@ impl Ui {
         }
 
         // Tab-Liste.
-        self.tabs_label.set(fs, "TABS", 11.0 * s, &self.ui_family, true);
+        self.tabs_label.set(fs, if self.private { "PRIVAT · TABS" } else { "TABS" }, 11.0 * s, &self.ui_family, true);
+        if let Some(pr) = layout.new_private {
+            let pa = self.anim(Hit::NewPrivate);
+            if pa > 0.0 {
+                cards.push(RoundRect::new(pr.x, pr.y, pr.w, pr.h, t.hover.with_alpha((pa * 200.0) as u8), 9.0 * s));
+            }
+            self.private_icon.set(fs, ICON_PRIVATE, 11.0 * s, &self.icon_family, false);
+            self.private_label.set(fs, "Privates Fenster", 13.5 * s, &self.ui_family, false);
+        }
         while self.tab_labels.len() < tabs.tabs.len() {
             self.tab_labels.push(TabLabels { icon: Label::new(fs), title: Label::new(fs), close: Label::new(fs) });
         }
@@ -1322,7 +1375,23 @@ impl Ui {
             });
         }
         let lr = layout.tabs_label;
-        text.push(TextBlock { buffer: &self.tabs_label.buffer, x: lr.x, y: lr.y, color: t.dim, clip: Some(side_clip) });
+        text.push(TextBlock {
+            buffer: &self.tabs_label.buffer,
+            x: lr.x,
+            y: lr.y,
+            color: if self.private { t.accent } else { t.dim },
+            clip: Some(side_clip),
+        });
+        if let Some(pr) = layout.new_private {
+            text.push(left_icon(&self.private_icon, pr, t.dim));
+            text.push(TextBlock {
+                buffer: &self.private_label.buffer,
+                x: (pr.x + 34.0 * s).round(),
+                y: (pr.y + (pr.h - self.private_label.line_height()) / 2.0).round(),
+                color: t.dim,
+                clip: Some(side_clip),
+            });
+        }
         for (i, state) in tabs.tabs.iter().enumerate() {
             let r = layout.tabs[i];
             let labels = &self.tab_labels[i];
@@ -1481,13 +1550,13 @@ mod tests {
 
     #[test]
     fn favoriten_und_vorschlaege() {
-        let l = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 1.0, Counts { tabs: 2, favorites: 7, suggestions: 3, prompt: false, downloads: 0 });
+        let l = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 1.0, Counts { tabs: 2, favorites: 7, suggestions: 3, prompt: false, downloads: 0, private_button: false });
         // 6 Favoriten pro Reihe, der siebte rutscht in die zweite Reihe.
         assert_eq!(l.favorites[6].x, l.favorites[0].x);
         assert!(l.favorites[6].y > l.favorites[0].y);
         assert!(l.tabs_label.y > l.favorites[6].y + l.favorites[6].h);
         // Ohne Vorschläge trifft man den Favoriten …
-        let plain = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 1.0, Counts { tabs: 2, favorites: 7, suggestions: 0, prompt: false, downloads: 0 });
+        let plain = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 1.0, Counts { tabs: 2, favorites: 7, suggestions: 0, prompt: false, downloads: 0, private_button: false });
         let f = plain.favorites[1];
         assert_eq!(plain.hit(f.x + 3.0, f.y + 3.0, false), Hit::Favorite(1));
         // … mit Vorschlägen liegen diese darüber und gewinnen.

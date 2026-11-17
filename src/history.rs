@@ -27,6 +27,8 @@ pub struct Favorite {
 
 pub struct Store {
     conn: Mutex<Connection>,
+    /// Privates Fenster: Besuche werden nicht gespeichert.
+    read_only: bool,
 }
 
 pub fn now() -> i64 {
@@ -72,7 +74,7 @@ impl Store {
         if let Err(e) = r {
             log::error!("Verlauf-Datenbank: {e}");
         }
-        Self { conn: Mutex::new(conn) }
+        Self { conn: Mutex::new(conn), read_only: false }
     }
 
     fn db(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -83,8 +85,14 @@ impl Store {
         self.record_visit_at(url, title, now());
     }
 
+    /// Für das private Fenster: Verlauf lesen ja, schreiben nein.
+    pub fn read_only(mut self) -> Self {
+        self.read_only = true;
+        self
+    }
+
     fn record_visit_at(&self, url: &str, title: Option<&str>, at: i64) {
-        if !is_recordable(url) {
+        if self.read_only || !is_recordable(url) {
             return;
         }
         let r = self.db().execute(
@@ -99,7 +107,7 @@ impl Store {
     }
 
     pub fn set_title(&self, url: &str, title: &str) {
-        if title.trim().is_empty() {
+        if self.read_only || title.trim().is_empty() {
             return;
         }
         let _ = self.db().execute("UPDATE visits SET title = ?2 WHERE url = ?1", params![url, title]);

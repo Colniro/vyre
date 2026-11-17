@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 
 use engine::{Engine, EngineEvent, ServoEngine};
 use render::{RoundRect, Scene};
-use ui::{Counts, FpsCounter, Hit, Layout, SidebarMode, Stats, Suggestion, SuggestionKind, TabsView, THEME, Ui};
+use ui::{Counts, FpsCounter, Hit, Layout, SidebarMode, Stats, Suggestion, SuggestionKind, TabsView, Ui};
 use url::Url;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -68,15 +68,18 @@ fn main() {
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .expect("Ereignisschleife konnte nicht erstellt werden");
-    // Startadresse oder Suchbegriffe von der Kommandozeile; sonst die Neuer-Tab-Seite.
-    let start = std::env::args().nth(1);
-    let mut app = App { proxy: event_loop.create_proxy(), start, browser: None };
+    // "--privat" öffnet ein privates Fenster; sonst Startadresse oder Suchbegriffe.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let private = args.iter().any(|a| a == "--privat");
+    let start = args.into_iter().find(|a| !a.starts_with("--"));
+    let mut app = App { proxy: event_loop.create_proxy(), start, private, browser: None };
     event_loop.run_app(&mut app).expect("Ereignisschleife");
 }
 
 struct App {
     proxy: EventLoopProxy<UserEvent>,
     start: Option<String>,
+    private: bool,
     browser: Option<Browser>,
 }
 
@@ -174,7 +177,7 @@ impl ApplicationHandler<UserEvent> for App {
         if self.browser.is_some() {
             return;
         }
-        match Browser::new(event_loop, self.proxy.clone(), self.start.clone()) {
+        match Browser::new(event_loop, self.proxy.clone(), self.start.clone(), self.private) {
             Ok(b) => self.browser = Some(b),
             Err(e) => {
                 log::error!("Vyre konnte nicht starten: {e}");
@@ -230,19 +233,22 @@ fn to_bounds(r: ui::Rect) -> (i32, i32, u32, u32) {
 }
 
 impl Browser {
-    fn new(event_loop: &ActiveEventLoop, proxy: EventLoopProxy<UserEvent>, start: Option<String>) -> Result<Self, String> {
+    fn new(event_loop: &ActiveEventLoop, proxy: EventLoopProxy<UserEvent>, start: Option<String>, private: bool) -> Result<Self, String> {
         let settings = settings::Shared::load();
         let vyre_dir = engine::profile_dir().parent().map(|p| p.to_path_buf()).unwrap_or_default();
-        let history = Arc::new(history::Store::open(&vyre_dir.join("verlauf.sqlite")));
+        // Privat: Verlauf nur lesen (für Vorschläge), nichts speichern.
+        let history = history::Store::open(&vyre_dir.join("verlauf.sqlite"));
+        let history = Arc::new(if private { history.read_only() } else { history });
         let vault = Arc::new(vault::Vault::open(&vyre_dir.join("passwoerter.sqlite")));
-        let downloads = downloads::Downloads::new(downloads::downloads_dir(), Some(vyre_dir.join("downloads.json")), {
+        let downloads = downloads::Downloads::new(downloads::downloads_dir(), (!private).then(|| vyre_dir.join("downloads.json")), {
             let proxy = proxy.clone();
             move || {
                 let _ = proxy.send_event(UserEvent::DownloadsChanged);
             }
         });
         // Adresse von der Kommandozeile, sonst die Tabs vom letzten Mal, sonst ein neuer Tab.
-        let keep_session = start.is_some();
+        // Privat: keine Sitzung wiederherstellen und keine speichern.
+        let keep_session = start.is_some() || private;
         let restore = match start {
             Some(arg) => session::Session {
                 urls: search::resolve_input(&arg, settings.get().search_engine.as_deref())
@@ -250,6 +256,7 @@ impl Browser {
                     .unwrap_or_default(),
                 active: 0,
             },
+            None if private => session::Session::default(),
             None => session::Session::load(&session::path()).unwrap_or_default(),
         };
         let mut urls: Vec<Url> = restore.urls.iter().filter_map(|u| Url::parse(u).ok()).collect();
@@ -267,7 +274,7 @@ impl Browser {
             },
         );
         let attrs = Window::default_attributes()
-            .with_title("Vyre")
+            .with_title(if private { "Vyre – Privat" } else { "Vyre" })
             .with_decorations(false)
             .with_inner_size(LogicalSize::new(1280.0, 820.0))
             .with_min_inner_size(LogicalSize::new(640.0, 420.0))
@@ -279,14 +286,15 @@ impl Browser {
         let t = Instant::now();
         let mut renderer = pollster::block_on(render::Renderer::new(window.clone(), event_loop.owned_display_handle()));
         log::info!("GPU bereit nach {:?}: {:?}", t.elapsed(), renderer.gpu_info());
-        let ui = Ui::new(renderer.font_system());
+        let mut ui = Ui::new(renderer.font_system());
+        ui.set_private(private);
         let sidebar = Sidebar::new(settings.get().sidebar);
         let size = window.inner_size();
         let layout = Layout::new(size.width, size.height, window.scale_factor() as f32, sidebar.mode, sidebar.reveal, Counts { tabs: 1, ..Default::default() });
 
         // Eigene Seiten unter vyre:// (Neuer Tab, Suche).
         let mut protocols = servo::protocol_handler::ProtocolRegistry::with_internal_protocols();
-        if let Err(e) = protocols.register("vyre", newtab::VyreProtocol::new(
+        if let Err(e) = protocols.register("vyre", newtab::VyreProtocol::with_private(private, newtab::VyreProtocol::new(
             settings.clone(),
             history.clone(),
             vault.clone(),
@@ -303,7 +311,7 @@ impl Browser {
                     let _ = proxy.send_event(UserEvent::DownloadOp(id, op));
                 }
             },
-        )) {
+        ))) {
             log::error!("vyre:// nicht registriert: {e:?}");
         }
         let t = Instant::now();
@@ -318,6 +326,7 @@ impl Browser {
             history.clone(),
             settings.clone(),
             downloads.clone(),
+            private,
         )?;
         for url in urls {
             engine.new_tab(url);
@@ -514,6 +523,7 @@ impl Browser {
                 suggestions: if self.ui.url_focused { self.ui.suggestions.len() } else { 0 },
                 prompt: self.pending_save.is_some(),
                 downloads: self.downloads.sidebar().len(),
+                private_button: !self.ui.private,
             },
         )
         .with_split(&self.engine.rows(), self.engine.ratio(), self.drop_side);
@@ -733,7 +743,8 @@ impl Browser {
                 }
             }
             Some(pwfill::Message::Submit { username, password }) => {
-                if self.vault.is_never(&origin) || self.vault.has_exact(&origin, &username, &password) {
+                // Privat: gespeicherte Passwörter ausfüllen ja, neue speichern nein.
+                if self.ui.private || self.vault.is_never(&origin) || self.vault.has_exact(&origin, &username, &password) {
                     return;
                 }
                 self.pending_save = Some((origin, username, password));
@@ -927,6 +938,7 @@ impl Browser {
             Hit::Close => event_loop.exit(),
             Hit::TabClose(i) => self.close_tab(event_loop, i),
             Hit::NewTab => self.new_tab(),
+            Hit::NewPrivate => open_private_window(),
             Hit::Shield => self.toggle_adblock(),
             Hit::Tab(i) => self.select_tab(i),
             Hit::Star => self.toggle_favorite(),
@@ -981,6 +993,7 @@ impl Browser {
             }
             Key::Character(c) if ctrl && char_is(c, "b") => self.toggle_sidebar(),
             Key::Character(c) if ctrl && char_is(c, "d") => self.toggle_favorite(),
+            Key::Character(c) if ctrl && shift && char_is(c, "n") => open_private_window(),
             Key::Character(c) if ctrl && !shift && char_is(c, "s") => self.engine.save_current(),
             // Aktiven Tab sofort schlafen legen.
             Key::Character(c) if ctrl && shift && char_is(c, "z") => {
@@ -1138,13 +1151,14 @@ impl Browser {
             save_prompt: prompt_host.as_ref().map(|(h, u)| (h.as_str(), u.as_str())),
             downloads: &sidebar_downloads,
         };
+        let background = self.ui.theme().bg;
         let mut frame = self.ui.build(self.renderer.font_system(), &self.layout, &view, &stats);
         // Weicher Schatten unter dem Seitenbereich.
         let c = self.layout.content;
         let s = self.layout.scale;
         frame.cards.insert(0, RoundRect::shadow(c.x, c.y, c.w, c.h, render::Rgba(0, 0, 0, 90), 6.0 * s, 6.0 * s));
         let scene = Scene {
-            background: THEME.bg,
+            background,
             cards: &frame.cards,
             under: &frame.under,
             text: &frame.text,
@@ -1177,4 +1191,16 @@ fn resize_cursor(dir: ResizeDirection) -> CursorIcon {
 fn short_url(url: &str) -> String {
     let s = url.split("://").nth(1).unwrap_or(url);
     s.trim_start_matches("www.").trim_end_matches('/').to_string()
+}
+
+/// Startet Vyre noch einmal als privates Fenster (eigener Prozess, nichts wird gespeichert).
+fn open_private_window() {
+    match std::env::current_exe() {
+        Ok(exe) => {
+            if let Err(e) = std::process::Command::new(exe).arg("--privat").spawn() {
+                log::error!("Privates Fenster nicht gestartet: {e}");
+            }
+        }
+        Err(e) => log::error!("Privates Fenster: {e}"),
+    }
 }

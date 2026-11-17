@@ -64,6 +64,21 @@ const PROBE_PAGE: &str = "(function(){var b=document.body;if(!b)return [0,0,fals
     var bad=/(browser|browsers)[^.]{0,40}(not supported|isn't supported|is not supported|unsupported|nicht unterst\u{fc}tzt)|unsupported browser|update your browser|upgrade your browser|switch to a supported browser|use a supported browser|aktualisiere deinen browser|browser wird nicht unterst\u{fc}tzt/.test(l);\
     return [t.length,b.getElementsByTagName('*').length,bad];})()";
 
+/// Nach so langer Zeit ohne Benutzung schläft ein Tab ein.
+const SLEEP_AFTER: Duration = Duration::from_secs(10 * 60);
+/// So oft wird nach Tabs gesucht, die einschlafen können.
+const SLEEP_CHECK_EVERY: Duration = Duration::from_secs(30);
+
+/// Vor dem Einschlafen: Gibt es ungesendete Formulareingaben, läuft Ton oder Video?
+pub(crate) const PROBE_SLEEP: &str = "(function(){var d=false,p=false;\
+    document.querySelectorAll('input,textarea,select').forEach(function(e){var t=(e.type||'').toLowerCase();\
+    if(t==='checkbox'||t==='radio'){if(e.checked!==e.defaultChecked)d=true;}\
+    else if(e.tagName==='SELECT'){for(var i=0;i<e.options.length;i++){if(e.options[i].selected!==e.options[i].defaultSelected)d=true;}}\
+    else if(t!=='hidden'&&t!=='submit'&&t!=='button'&&e.value!==''&&e.value!==e.defaultValue)d=true;});\
+    var a=document.activeElement;if(a&&a.isContentEditable&&(a.innerText||'').trim().length>0)d=true;\
+    document.querySelectorAll('audio,video').forEach(function(m){if(!m.paused&&!m.muted&&m.volume>0)p=true;});\
+    return [d,p];})()";
+
 /// So lange nach dem Laden wird geprüft, damit Skripte Zeit zum Aufbauen haben.
 const PROBE_DELAY: Duration = Duration::from_millis(2500);
 
@@ -113,6 +128,8 @@ pub struct PageState {
     pub can_forward: bool,
     /// Blockierte Anfragen (Werbung, Tracker) seit dem Laden der Seite.
     pub blocked: usize,
+    /// Der Tab schläft: seine Seite ist aus dem Speicher und lädt beim Anklicken neu.
+    pub asleep: bool,
 }
 
 /// Meldungen der Engines an die Oberfläche.
@@ -146,6 +163,8 @@ pub trait Engine {
     fn close_tab(&mut self, index: usize) -> bool;
     /// Wechselt den aktiven Tab von Hand zur anderen Engine und merkt sich das für die Seite.
     fn toggle_engine(&mut self);
+    /// Legt den aktiven Tab sofort schlafen und wechselt zum vorher benutzten.
+    fn sleep_active(&mut self);
     /// Zeigt `other` neben `target` (rechts oder links davon).
     fn split(&mut self, target: usize, other: usize, other_right: bool);
     /// Löst den Tab aus seiner geteilten Ansicht.
@@ -230,6 +249,8 @@ struct Shared {
     pending_css: RefCell<Vec<(WebView, String)>>,
     /// Tabs, die zu WebView2 wechseln sollen.
     switch: RefCell<Vec<SwitchRequest>>,
+    /// Ergebnis der Prüfung vor dem Einschlafen: Tab-Nummer und ob er wach bleiben muss.
+    sleep_checks: Rc<RefCell<Vec<(u64, bool)>>>,
 }
 
 impl Shared {
@@ -427,11 +448,21 @@ impl WebViewDelegate for Delegate {
 enum Backend {
     Servo { webview: WebView, delegate: Rc<Delegate> },
     Edge(EdgeView),
+    /// Schläft: nur Adresse und Titel sind übrig.
+    Asleep(PageState),
 }
 
 struct Tab {
     id: u64,
     backend: Backend,
+    /// Wann der Tab zuletzt zu sehen war.
+    last_used: Cell<Instant>,
+}
+
+impl Tab {
+    fn new(id: u64, backend: Backend) -> Self {
+        Self { id, backend, last_used: Cell::new(Instant::now()) }
+    }
 }
 
 impl Tab {
@@ -439,13 +470,14 @@ impl Tab {
         match &self.backend {
             Backend::Servo { delegate, .. } => delegate.state.borrow().clone(),
             Backend::Edge(e) => e.state.borrow().clone(),
+            Backend::Asleep(s) => s.clone(),
         }
     }
 
     fn servo(&self) -> Option<&WebView> {
         match &self.backend {
             Backend::Servo { webview, .. } => Some(webview),
-            Backend::Edge(_) => None,
+            Backend::Edge(_) | Backend::Asleep(_) => None,
         }
     }
 
@@ -453,7 +485,7 @@ impl Tab {
     fn surface(&self) -> Option<usize> {
         match &self.backend {
             Backend::Servo { delegate, .. } => Some(delegate.surface.get()),
-            Backend::Edge(_) => None,
+            Backend::Edge(_) | Backend::Asleep(_) => None,
         }
     }
 }
@@ -493,6 +525,10 @@ pub struct ServoEngine {
     pointer: Vec<Cell<DevicePoint>>,
     fps: RefCell<FpsCounter>,
     events: Vec<EngineEvent>,
+    /// Nächste Suche nach Tabs, die einschlafen können.
+    next_sleep_check: Instant,
+    /// Tabs, deren Prüfung vor dem Einschlafen noch läuft.
+    sleep_pending: Vec<u64>,
 }
 
 /// Erstellt ein Kind-Fenster mit OpenGL-Kontext, in das Servo zeichnet.
@@ -571,6 +607,7 @@ impl ServoEngine {
             closed: RefCell::default(),
             pending_css: RefCell::default(),
             switch: RefCell::default(),
+            sleep_checks: Rc::default(),
         });
         let mut engine = Self {
             tabs: Vec::new(),
@@ -585,6 +622,8 @@ impl ServoEngine {
             pointer: vec![Cell::new(DevicePoint::new(0.0, 0.0)), Cell::new(DevicePoint::new(0.0, 0.0))],
             fps: RefCell::new(FpsCounter::default()),
             events: Vec::new(),
+            next_sleep_check: Instant::now() + SLEEP_CHECK_EVERY,
+            sleep_pending: Vec::new(),
         };
         engine.new_tab(url);
         Ok(engine)
@@ -685,8 +724,93 @@ impl ServoEngine {
 
     /// Zeigt den aktiven Tab (bzw. das aktive Paar) an der richtigen Stelle, alles andere nicht.
     fn show_active(&mut self) {
+        self.wake_visible();
         self.separate_surfaces();
         self.apply_view();
+    }
+
+    /// Weckt schlafende Tabs, die gleich zu sehen sein werden: sie laden ihre Seite neu.
+    fn wake_visible(&mut self) {
+        for (i, _) in self.view() {
+            let Backend::Asleep(state) = &self.tabs[i].backend else { continue };
+            let Some(url) = state.url.clone() else { continue };
+            log::info!("Tab wacht auf: {url}");
+            let id = self.tabs[i].id;
+            self.tabs[i].backend = self.backend_for(id, url, true, 0);
+        }
+    }
+
+    /// Legt einen Tab schlafen: die Seite wird freigegeben, Adresse und Titel bleiben.
+    fn sleep_tab(&mut self, index: usize) {
+        let Some(tab) = self.tabs.get_mut(index) else { return };
+        if matches!(tab.backend, Backend::Asleep(_)) {
+            return;
+        }
+        let mut state = tab.state();
+        if state.url.is_none() {
+            return;
+        }
+        log::info!("Tab schläft ein: {}", state.url.as_ref().map(|u| u.as_str()).unwrap_or(""));
+        state.asleep = true;
+        state.loading = false;
+        state.blocked = 0;
+        // Die alte Engine (Servo-WebView bzw. WebView2-Fenster) wird hier freigegeben.
+        tab.backend = Backend::Asleep(state);
+    }
+
+    /// Sucht Tabs, die lange nicht zu sehen waren, und prüft sie vor dem Einschlafen.
+    fn check_sleep(&mut self) {
+        let now = Instant::now();
+        let visible: Vec<usize> = self.view().into_iter().map(|(i, _)| i).collect();
+        for i in &visible {
+            self.tabs[*i].last_used.set(now);
+        }
+        // Ergebnisse der Prüfungen auswerten.
+        let results: Vec<(u64, bool)> = self.shared.sleep_checks.borrow_mut().drain(..).collect();
+        for (id, keep_awake) in results {
+            self.sleep_pending.retain(|p| *p != id);
+            let Some(i) = self.index_of(id) else { continue };
+            if keep_awake {
+                // Formulareingaben oder Ton: später noch einmal versuchen.
+                self.tabs[i].last_used.set(now);
+            } else if !self.view().iter().any(|(v, _)| *v == i) {
+                self.sleep_tab(i);
+            }
+        }
+        if now < self.next_sleep_check {
+            return;
+        }
+        self.next_sleep_check = now + SLEEP_CHECK_EVERY;
+        for (i, tab) in self.tabs.iter().enumerate() {
+            if visible.contains(&i)
+                || self.sleep_pending.contains(&tab.id)
+                || now.duration_since(tab.last_used.get()) < SLEEP_AFTER
+            {
+                continue;
+            }
+            let (id, results) = (tab.id, self.shared.sleep_checks.clone());
+            let report = move |keep: bool| results.borrow_mut().push((id, keep));
+            match &tab.backend {
+                Backend::Asleep(_) => continue,
+                Backend::Servo { webview, .. } => {
+                    webview.evaluate_javascript(PROBE_SLEEP, move |result| {
+                        let keep = match result {
+                            Ok(JSValue::Array(v)) => v.iter().any(|x| matches!(x, JSValue::Boolean(true))),
+                            // Unklar: lieber wach lassen.
+                            _ => true,
+                        };
+                        report(keep);
+                    });
+                }
+                Backend::Edge(e) => {
+                    if e.is_playing_audio() {
+                        continue;
+                    }
+                    e.eval(PROBE_SLEEP, move |json| report(json.contains("true") || json.is_empty()));
+                }
+            }
+            self.sleep_pending.push(tab.id);
+        }
     }
 
     fn apply_view(&self) {
@@ -715,6 +839,7 @@ impl ServoEngine {
                     e.set_visible(true);
                 }
                 (Backend::Edge(e), None) => e.set_visible(false),
+                (Backend::Asleep(_), _) => {}
             }
         }
         for (s, used) in surface_used.iter().enumerate() {
@@ -850,13 +975,14 @@ impl Engine for ServoEngine {
         }
         self.run_probes();
         let mut changed = self.handle_switches();
+        self.check_sleep();
 
         let opened: Vec<(WebView, Rc<Delegate>)> = self.shared.opened.borrow_mut().drain(..).collect();
         let closed: Vec<WebViewId> = self.shared.closed.borrow_mut().drain(..).collect();
         changed |= !opened.is_empty() || !closed.is_empty();
         for (webview, delegate) in opened {
             let id = self.new_id();
-            self.insert(Tab { id, backend: Backend::Servo { webview, delegate } });
+            self.insert(Tab::new(id, Backend::Servo { webview, delegate }));
         }
         for wid in closed {
             if let Some(i) = self.tabs.iter().position(|t| t.servo().is_some_and(|w| w.id() == wid)) {
@@ -933,7 +1059,7 @@ impl Engine for ServoEngine {
     fn new_tab(&mut self, url: Url) {
         let id = self.new_id();
         let backend = self.backend_for(id, url, true, 0);
-        self.insert(Tab { id, backend });
+        self.insert(Tab::new(id, backend));
     }
 
     fn close_tab(&mut self, index: usize) -> bool {
@@ -1001,12 +1127,32 @@ impl Engine for ServoEngine {
         }
     }
 
+    fn sleep_active(&mut self) {
+        if self.tabs.len() < 2 {
+            return;
+        }
+        let index = self.active;
+        // Zuerst weg vom Tab: zum vorher benutzten oder zum Nachbarn.
+        let next = self
+            .previous
+            .and_then(|id| self.index_of(id))
+            .filter(|i| *i != index)
+            .unwrap_or(if index + 1 < self.tabs.len() { index + 1 } else { index - 1 });
+        // Aus einer geteilten Ansicht lösen, sonst würde er gleich wieder geweckt.
+        let id = self.tabs[index].id;
+        self.pairs.retain(|p| p.left != id && p.right != id);
+        self.set_active(next);
+        self.sleep_tab(index);
+        self.show_active();
+    }
+
     fn toggle_engine(&mut self) {
         let Some(tab) = self.tab() else { return };
         let Some(url) = tab.state().url.filter(|u| matches!(u.scheme(), "http" | "https")) else { return };
         let to = match tab.backend {
             Backend::Servo { .. } => Choice::Edge,
             Backend::Edge(_) => Choice::Servo,
+            Backend::Asleep(_) => return,
         };
         if to == Choice::Edge && self.edge.failed() {
             return;
@@ -1041,7 +1187,7 @@ impl Engine for ServoEngine {
         match self.tab().map(|t| &t.backend) {
             Some(Backend::Servo { webview, .. }) => webview.reload(),
             Some(Backend::Edge(e)) => e.reload(),
-            None => {}
+            Some(Backend::Asleep(_)) | None => {}
         }
     }
 

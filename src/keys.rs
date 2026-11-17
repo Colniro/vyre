@@ -67,7 +67,7 @@ pub fn is_browser_shortcut(key: &winit::keyboard::Key, mods: ModifiersState) -> 
         K::Character(c) if ctrl => {
             let c = c.to_ascii_lowercase();
             matches!(c.as_str(), "l" | "r" | "t" | "w" | "b" | "d" | "h" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
-                || (shift && c == "e")
+                || (shift && (c == "e" || c == "z"))
         }
         K::Named(WinitNamed::Tab) => ctrl,
         K::Named(WinitNamed::Delete) => ctrl && shift,

@@ -1161,7 +1161,7 @@ impl Ui {
             let r = layout.tabs[i];
             let labels = &self.tab_labels[i];
             if !state.loading {
-                text.push(left_icon(&labels.icon, r, t.dim));
+                text.push(left_icon(&labels.icon, r, if state.asleep { t.dim.with_alpha(110) } else { t.dim }));
             }
             let show_close = self.hovered(Hit::Tab(i)) || (i == tabs.active && paired(layout, i).is_none());
             let title_right = if show_close { close_rect(r, s).x - 4.0 * s } else { r.x + r.w - 8.0 * s };
@@ -1169,7 +1169,13 @@ impl Ui {
                 buffer: &labels.title.buffer,
                 x: (r.x + 34.0 * s).round(),
                 y: (r.y + (r.h - labels.title.line_height()) / 2.0).round(),
-                color: if i == tabs.active { t.text } else { lerp(t.dim, t.text, 0.6) },
+                color: if i == tabs.active {
+                    t.text
+                } else if state.asleep {
+                    t.dim.with_alpha(150)
+                } else {
+                    lerp(t.dim, t.text, 0.6)
+                },
                 clip: Some([r.x.max(0.0) as i32, r.y as i32, title_right.min(side_clip[2] as f32).max(0.0) as i32, (r.y + r.h) as i32]),
             });
             if show_close {

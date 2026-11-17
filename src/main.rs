@@ -193,7 +193,8 @@ impl ApplicationHandler<UserEvent> for App {
             }
             event_loop.set_control_flow(ControlFlow::WaitUntil(due.max(Instant::now() + Duration::from_millis(16))));
         } else {
-            event_loop.set_control_flow(ControlFlow::Wait);
+            // Ohne FPS-Anzeige trotzdem ab und zu aufwachen, damit Tabs einschlafen können.
+            event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_secs(30)));
         }
     }
 
@@ -812,6 +813,11 @@ impl Browser {
             }
             Key::Character(c) if ctrl && char_is(c, "b") => self.toggle_sidebar(),
             Key::Character(c) if ctrl && char_is(c, "d") => self.toggle_favorite(),
+            // Aktiven Tab sofort schlafen legen.
+            Key::Character(c) if ctrl && shift && char_is(c, "z") => {
+                self.engine.sleep_active();
+                self.relayout();
+            }
             // Notausgang: Engine des Tabs von Hand wechseln (Servo <-> WebView2).
             Key::Character(c) if ctrl && shift && char_is(c, "e") => {
                 self.engine.toggle_engine();

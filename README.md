@@ -27,6 +27,7 @@ Der erste Build dauert lange, weil Servo mitgebaut wird. SpiderMonkey wird ferti
 | Strg+B | Seitenleiste: fest ↔ beim Hovern ausfahren |
 | Strg+D | Seite als Favorit anpinnen / lösen |
 | Strg+Umschalt+E | Engine des Tabs wechseln (Servo ↔ WebView2) |
+| Strg+Umschalt+Z | Aktiven Tab schlafen legen |
 | Strg+H, Strg+Umschalt+Entf | Verlauf |
 | ↑ / ↓ in der Adressleiste | Vorschlag wählen |
 
@@ -72,6 +73,15 @@ DuckDuckGo, das tausende weitere kennt.
   Ansicht, ersetzt er die Hälfte auf dieser Seite.
 - Sind beide Hälften Servo-Seiten, lädt eine davon beim Teilen einmal neu (Servo zeichnet
   sie in ein zweites Fenster). WebView2-Seiten laden nicht neu.
+
+## Schlafende Tabs
+
+Tabs, die 10 Minuten nicht zu sehen waren, schlafen ein: ihre Seite wird aus dem Speicher
+genommen, Adresse und Titel bleiben in der Seitenleiste (blass). Ein Klick weckt den Tab, die
+Seite lädt neu. Strg+Umschalt+Z legt den aktiven Tab sofort schlafen.
+
+Wach bleiben Tabs, die Ton oder Video abspielen, Tabs mit ungesendeten Formulareingaben und
+die gerade sichtbare geteilte Ansicht. Geprüft wird alle 30 Sekunden.
 
 ## Verlauf, Favoriten, Sitzung
 

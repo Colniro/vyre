@@ -606,6 +606,24 @@ impl EdgeView {
         }
     }
 
+    /// Spielt die Seite gerade Ton ab?
+    pub fn is_playing_audio(&self) -> bool {
+        let Some(wv) = self.webview() else { return false };
+        let Ok(wv8) = wv.cast::<ICoreWebView2_8>() else { return false };
+        let mut playing = BOOL(0);
+        // SAFETY: gültiges WebView2-Objekt auf dem UI-Thread.
+        let _ = unsafe { wv8.IsDocumentPlayingAudio(&mut playing) };
+        playing.as_bool()
+    }
+
+    /// Führt ein Skript aus und liefert das Ergebnis als JSON (leer, wenn nicht möglich).
+    pub fn eval(&self, script: &str, done: impl FnOnce(String) + 'static) {
+        match self.webview() {
+            Some(wv) => run_script(&wv, script, done),
+            None => done(String::new()),
+        }
+    }
+
     pub fn focus(&self) {
         match self.inner.controller.borrow().as_ref() {
             Some(c) => {

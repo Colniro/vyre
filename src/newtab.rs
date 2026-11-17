@@ -21,6 +21,7 @@ use servo::protocol_handler::{
 use url::Url;
 
 use crate::history::{self, Store};
+use crate::downloads::{self, Downloads};
 use crate::importer::Source;
 use crate::vault::Vault;
 use crate::search::{self, ENGINES};
@@ -29,6 +30,7 @@ use crate::settings::{self, Tile};
 pub const NEW_TAB_URL: &str = "vyre://neuer-tab";
 pub const HISTORY_URL: &str = "vyre://verlauf";
 pub const PASSWORDS_URL: &str = "vyre://passwoerter";
+pub const DOWNLOADS_URL: &str = "vyre://downloads";
 
 pub struct VyreProtocol {
     settings: settings::Shared,
@@ -36,6 +38,9 @@ pub struct VyreProtocol {
     vault: Arc<Vault>,
     /// Weckt das Hauptprogramm für den Import (Dateiauswahl, Fortschritt).
     import: Option<Box<dyn Fn(Source) + Send + Sync>>,
+    downloads: Option<Downloads>,
+    /// Pausieren/Fortsetzen/Abbrechen über das Hauptprogramm (WebView2-Downloads).
+    download_op: Option<Box<dyn Fn(u64, String) + Send + Sync>>,
     token: String,
 }
 
@@ -45,11 +50,20 @@ impl VyreProtocol {
         history: Arc<Store>,
         vault: Arc<Vault>,
         import: impl Fn(Source) + Send + Sync + 'static,
+        downloads: Downloads,
+        download_op: impl Fn(u64, String) + Send + Sync + 'static,
     ) -> Self {
         let a = RandomState::new().build_hasher().finish();
         let mut h = RandomState::new().build_hasher();
         h.write_u64(a ^ std::process::id() as u64);
-        Self { settings, history, vault, import: Some(Box::new(import)), token: format!("{a:016x}{:016x}", h.finish()) }
+        Self {
+            settings,
+            history,
+            vault,
+            import: Some(Box::new(import)),
+            downloads: Some(downloads),
+            download_op: Some(Box::new(download_op)),
+            token: format!("{a:016x}{:016x}", h.finish()) }
     }
 
     /// Erzeugt das HTML für eine `vyre://`-Adresse.
@@ -59,6 +73,7 @@ impl VyreProtocol {
             "neuer-tab" => self.new_tab(),
             "verlauf" => self.history_page(&param("q").unwrap_or_default()),
             "kein-https" => self.no_https_page(&param("url").unwrap_or_default()),
+            "downloads" => self.downloads_page(),
             "passwoerter" => {
                 // Anzeigen eines Passworts nur mit Schlüssel (also nur von der Seite selbst aus).
                 let reveal = param("zeige")
@@ -88,6 +103,24 @@ impl VyreProtocol {
     /// Führt eine Aktion aus und liefert die Seite, zu der es danach zurückgeht.
     fn action(&self, path: &str, param: &dyn Fn(&str) -> Option<String>) -> String {
         match path {
+            "/download" => {
+                let (Some(d), Some(id)) = (&self.downloads, param("id").and_then(|i| i.parse::<u64>().ok())) else {
+                    return DOWNLOADS_URL.into();
+                };
+                let Some(entry) = d.get(id) else { return DOWNLOADS_URL.into() };
+                match param("op").as_deref() {
+                    Some("open") if entry.state == downloads::State::Done => downloads::open_file(&entry.path),
+                    Some("folder") => downloads::show_in_folder(&entry.path),
+                    Some("remove") => d.remove(id),
+                    Some(op @ ("pause" | "resume" | "cancel")) => {
+                        if let Some(f) = &self.download_op {
+                            f(id, op.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+                return DOWNLOADS_URL.into();
+            }
             "/passwort-weg" => {
                 if let Some(id) = param("id").and_then(|i| i.parse().ok()) {
                     self.vault.delete(id);
@@ -160,6 +193,92 @@ impl VyreProtocol {
             other => log::warn!("unbekannte vyre-Aktion: {other}"),
         }
         NEW_TAB_URL.into()
+    }
+
+    /// Alle Downloads mit Steuerung; lädt sich neu, solange etwas läuft.
+    fn downloads_page(&self) -> String {
+        let Some(d) = &self.downloads else { return message("Downloads nicht verfügbar.") };
+        d.dismiss_finished();
+        let list = d.list();
+        let active = list.iter().any(|e| e.is_active());
+        let mut rows = String::new();
+        for e in list.iter().rev() {
+            let mut buttons = String::new();
+            let btn = |op: &str, label: &str, extra: &str| {
+                format!(r#"<button class="act{extra}" data-op="{op}" data-id="{}">{label}</button>"#, e.id)
+            };
+            match e.state {
+                downloads::State::Running => {
+                    buttons += &btn("pause", "Pausieren", "");
+                    buttons += &btn("cancel", "Abbrechen", "");
+                }
+                downloads::State::Paused => {
+                    buttons += &btn("resume", "Fortsetzen", "");
+                    buttons += &btn("cancel", "Abbrechen", "");
+                }
+                downloads::State::Done => {
+                    // Programme starten nur nach einer zweiten Bestätigung.
+                    buttons += &btn("open", "Öffnen", if e.is_program() { " program" } else { "" });
+                    buttons += &btn("folder", "Im Ordner zeigen", "");
+                    buttons += &btn("remove", "Entfernen", "");
+                }
+                _ => buttons += &btn("remove", "Entfernen", ""),
+            }
+            let bar = match downloads::progress(e) {
+                Some(p) if e.is_active() => format!(r#"<div class="bar"><div style="width:{:.1}%"></div></div>"#, p * 100.0),
+                _ => String::new(),
+            };
+            rows += &format!(
+                r#"<div class="dl"><div class="info"><div class="t">{name}</div><div class="u">{status}</div>{bar}</div><div class="acts">{buttons}</div></div>"#,
+                name = esc(&e.name),
+                status = esc(&downloads::status_text(e)),
+            );
+        }
+        if list.is_empty() {
+            rows = "<p class=\"empty\">Noch keine Downloads.</p>".into();
+        }
+        let refresh = if active { r#"<meta http-equiv="refresh" content="1">"# } else { "" };
+        format!(
+            r##"<!doctype html>
+<html lang="de"><head><meta charset="utf-8"><title>Downloads</title>{refresh}
+<style>{CSS}{HISTORY_CSS}
+.dl {{ display: flex; align-items: center; gap: 14px; padding: 10px 12px; border-radius: 10px; }}
+.dl:hover {{ background: #21212b; }}
+.dl .info {{ flex: 1; min-width: 0; }}
+.dl .t {{ font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+.dl .u {{ font-size: 12px; color: #8a8a9c; margin-top: 2px; }}
+.bar {{ height: 4px; background: #15151c; border-radius: 2px; margin-top: 6px; overflow: hidden; }}
+.bar div {{ height: 4px; background: #9d8cff; }}
+.acts {{ display: flex; gap: 6px; }}
+.act {{ padding: 6px 11px; border-radius: 8px; border: 1.5px solid #2d2d3a; background: #21212b; color: #e8e8f0; font-size: 12px; cursor: pointer; }}
+.act:hover {{ border-color: #9d8cff; }}
+.act.armed {{ border-color: #c42b1c; background: #3a1f1f; }}
+</style></head>
+<body><div class="page">
+  <a href="#" class="back" id="back">← Zurück</a>
+  <h1>Downloads</h1>
+  <h3>Gespeichert in {dir}</h3>
+  {rows}
+</div>
+<script>
+var T = {token_js};
+document.getElementById("back").addEventListener("click", function (e) {{
+  e.preventDefault();
+  if (history.length > 1) history.back(); else location.replace("vyre://neuer-tab");
+}});
+document.querySelectorAll(".act").forEach(function (b) {{
+  b.addEventListener("click", function () {{
+    if (b.classList.contains("program") && !b.dataset.armed) {{
+      b.dataset.armed = "1"; b.textContent = "Programm wirklich starten?"; b.classList.add("armed"); return;
+    }}
+    location.replace("vyre://aktion/download?t=" + T + "&op=" + b.dataset.op + "&id=" + b.dataset.id);
+  }});
+}});
+</script>
+</body></html>"##,
+            dir = esc(&downloads::downloads_dir().to_string_lossy()),
+            token_js = crate::engine::js_string(&self.token),
+        )
     }
 
     /// Passwort-Verwaltung mit Import.
@@ -396,7 +515,7 @@ document.querySelectorAll(".actions button").forEach(function (b) {{
   <form id="search" autocomplete="off">
     <input id="q" name="q" placeholder="Mit {engine} suchen oder !Bang eingeben (!yt, !w, !gh …)">
   </form>
-  <div class="engine-line">Suchmaschine: {engine} · <a href="#" id="change">ändern</a> · <a href="vyre://verlauf">Verlauf</a> · <a href="vyre://passwoerter">Passwörter</a></div>
+  <div class="engine-line">Suchmaschine: {engine} · <a href="#" id="change">ändern</a> · <a href="vyre://verlauf">Verlauf</a> · <a href="vyre://passwoerter">Passwörter</a> · <a href="vyre://downloads">Downloads</a></div>
   <div class="tiles">{tiles}
     <div class="tile add"><a href="#" id="add"><span class="icon plus">+</span><span class="name">Hinzufügen</span></a></div>
   </div>
@@ -598,6 +717,8 @@ mod tests {
             history: Arc::new(Store::in_memory()),
             vault: Arc::new(Vault::in_memory()),
             import: None,
+            downloads: None,
+            download_op: None,
             token: "geheim".into(),
         }
     }

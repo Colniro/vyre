@@ -117,6 +117,9 @@ pub enum Hit {
     PwSave,
     PwNever,
     PwDismiss,
+    /// Download unten in der Seitenleiste (öffnet vyre://downloads) und sein Schließen-Kreuz.
+    Download(usize),
+    DownloadClose(usize),
     Tab(usize),
     TabClose(usize),
     NewTab,
@@ -163,6 +166,8 @@ pub struct Layout {
     pub pw_save: Rect,
     pub pw_never: Rect,
     pub pw_close: Rect,
+    /// Downloads unten in der Seitenleiste, über der FPS-Anzeige.
+    pub downloads: Vec<Rect>,
     /// Angepinnte Favoriten als kleine Quadrate unter der Adressleiste.
     pub favorites: Vec<Rect>,
     /// Vorschläge, schwebend unter der Adressleiste.
@@ -196,6 +201,8 @@ pub struct Counts {
     pub suggestions: usize,
     /// Karte "Passwort speichern?" unter der Adressleiste.
     pub prompt: bool,
+    /// Downloads unten in der Seitenleiste.
+    pub downloads: usize,
 }
 
 const FAVS_PER_ROW: usize = 6;
@@ -272,6 +279,15 @@ impl Layout {
             },
         };
         let fps = Rect { x: sx + pad + 4.0 * s, y: h - 46.0 * s, w: sw - 2.0 * pad, h: 40.0 * s };
+        let dl_h = 46.0 * s;
+        let downloads: Vec<Rect> = (0..counts.downloads)
+            .map(|i| Rect {
+                x: sx + pad,
+                y: fps.y - 8.0 * s - (counts.downloads - i) as f32 * (dl_h + 4.0 * s),
+                w: sw - 2.0 * pad,
+                h: dl_h,
+            })
+            .collect();
         Self {
             scale,
             width: w,
@@ -288,6 +304,7 @@ impl Layout {
             pw_save,
             pw_never,
             pw_close,
+            downloads,
             favorites,
             suggestions,
             tabs_label,
@@ -419,6 +436,12 @@ impl Layout {
             }
             if self.new_tab.contains(x, y) {
                 return Hit::NewTab;
+            }
+            for (i, r) in self.downloads.iter().enumerate() {
+                if r.contains(x, y) {
+                    let close = Rect { x: r.x + r.w - 28.0 * self.scale, y: r.y + 4.0 * self.scale, w: 24.0 * self.scale, h: 24.0 * self.scale };
+                    return if close.contains(x, y) { Hit::DownloadClose(i) } else { Hit::Download(i) };
+                }
             }
         }
         if self.divider.is_some_and(|d| d.contains(x, y)) {
@@ -708,6 +731,7 @@ pub struct Ui {
     shield_count: Label,
     star_icon: Label,
     pw_labels: [Label; 5],
+    dl_labels: Vec<[Label; 3]>,
     fav_labels: Vec<Label>,
     sug_labels: Vec<SuggestionLabels>,
     /// Vorschläge zur aktuellen Eingabe; der erste ist das, was Enter ohne Auswahl tut.
@@ -763,6 +787,8 @@ pub struct TabsView<'a> {
     pub is_favorite: bool,
     /// Karte "Passwort speichern?": Seite und Benutzername.
     pub save_prompt: Option<(&'a str, &'a str)>,
+    /// Downloads für die Seitenleiste.
+    pub downloads: &'a [crate::downloads::Entry],
 }
 
 fn paired(layout: &Layout, i: usize) -> Option<(usize, usize, Rect)> {
@@ -800,6 +826,7 @@ impl Ui {
             shield_count: Label::new(fs),
             star_icon: Label::new(fs),
             pw_labels: [Label::new(fs), Label::new(fs), Label::new(fs), Label::new(fs), Label::new(fs)],
+            dl_labels: Vec::new(),
             fav_labels: Vec::new(),
             sug_labels: Vec::new(),
             suggestions: Vec::new(),
@@ -1024,6 +1051,38 @@ impl Ui {
             close.set(fs, ICON_CLOSE, 8.5 * s, &self.icon_family, false);
         }
 
+        // Downloads unten in der Seitenleiste.
+        while self.dl_labels.len() < tabs.downloads.len() {
+            self.dl_labels.push([Label::new(fs), Label::new(fs), Label::new(fs)]);
+        }
+        for (i, d) in tabs.downloads.iter().enumerate().take(layout.downloads.len()) {
+            let r = layout.downloads[i];
+            let a = self.anim(Hit::Download(i));
+            cards.push(RoundRect::new(r.x, r.y, r.w, r.h, lerp(t.surface, t.hover, a * 0.7), 9.0 * s));
+            let bar_y = r.y + r.h - 6.0 * s;
+            let bar_w = r.w - 20.0 * s;
+            match crate::downloads::progress(d) {
+                Some(p) if d.is_active() => {
+                    cards.push(RoundRect::new(r.x + 10.0 * s, bar_y, bar_w, 3.0 * s, t.bg, 1.5 * s));
+                    cards.push(RoundRect::new(r.x + 10.0 * s, bar_y, (bar_w * p).max(3.0 * s), 3.0 * s, t.accent, 1.5 * s));
+                }
+                None if d.is_active() => {
+                    // Größe unbekannt: wandernder Abschnitt.
+                    let phase = (Instant::now().duration_since(self.last_anim).as_secs_f32() + i as f32 * 0.3).fract();
+                    cards.push(RoundRect::new(r.x + 10.0 * s + phase * bar_w * 0.7, bar_y, bar_w * 0.3, 3.0 * s, t.accent, 1.5 * s));
+                }
+                _ => {}
+            }
+            let ca = self.anim(Hit::DownloadClose(i));
+            if ca > 0.0 {
+                cards.push(RoundRect::new(r.x + r.w - 28.0 * s, r.y + 4.0 * s, 24.0 * s, 24.0 * s, t.hover.with_alpha((ca * 255.0) as u8), 6.0 * s));
+            }
+            let [name, status, close] = &mut self.dl_labels[i];
+            name.set(fs, &d.name, 12.5 * s, &self.ui_family, false);
+            status.set(fs, &crate::downloads::status_text(d), 10.5 * s, &self.ui_family, false);
+            close.set(fs, ICON_CLOSE, 8.0 * s, &self.icon_family, false);
+        }
+
         // Angepinnte Favoriten: farbiges Quadrat mit Anfangsbuchstaben.
         while self.fav_labels.len() < tabs.favorites.len() {
             self.fav_labels.push(Label::new(fs));
@@ -1209,6 +1268,22 @@ impl Ui {
         }
         for (i, l) in self.fav_labels.iter().enumerate() {
             text.push(centered(l, layout.favorites[i], Rgba::rgb(255, 255, 255)));
+        }
+        for (i, d) in tabs.downloads.iter().enumerate().take(layout.downloads.len()) {
+            let r = layout.downloads[i];
+            let [name, status, close] = &self.dl_labels[i];
+            let clip = Some([r.x.max(0.0) as i32, r.y as i32, (r.x + r.w - 30.0 * s).max(0.0) as i32, (r.y + r.h) as i32]);
+            text.push(TextBlock { buffer: &name.buffer, x: (r.x + 10.0 * s).round(), y: (r.y + 5.0 * s).round(), color: t.text, clip });
+            let failed = matches!(d.state, crate::downloads::State::Failed(_));
+            text.push(TextBlock {
+                buffer: &status.buffer,
+                x: (r.x + 10.0 * s).round(),
+                y: (r.y + 6.0 * s + name.line_height()).round(),
+                color: if failed { Rgba::rgb(0xff, 0x8a, 0x7a) } else { t.dim },
+                clip,
+            });
+            let cr = Rect { x: r.x + r.w - 28.0 * s, y: r.y + 4.0 * s, w: 24.0 * s, h: 24.0 * s };
+            text.push(centered(close, cr, t.dim));
         }
         if let (Some(c), Some(_)) = (layout.pw_card, tabs.save_prompt) {
             let [title, detail, save, never, close] = &self.pw_labels;
@@ -1406,13 +1481,13 @@ mod tests {
 
     #[test]
     fn favoriten_und_vorschlaege() {
-        let l = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 1.0, Counts { tabs: 2, favorites: 7, suggestions: 3, prompt: false });
+        let l = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 1.0, Counts { tabs: 2, favorites: 7, suggestions: 3, prompt: false, downloads: 0 });
         // 6 Favoriten pro Reihe, der siebte rutscht in die zweite Reihe.
         assert_eq!(l.favorites[6].x, l.favorites[0].x);
         assert!(l.favorites[6].y > l.favorites[0].y);
         assert!(l.tabs_label.y > l.favorites[6].y + l.favorites[6].h);
         // Ohne Vorschläge trifft man den Favoriten …
-        let plain = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 1.0, Counts { tabs: 2, favorites: 7, suggestions: 0, prompt: false });
+        let plain = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 1.0, Counts { tabs: 2, favorites: 7, suggestions: 0, prompt: false, downloads: 0 });
         let f = plain.favorites[1];
         assert_eq!(plain.hit(f.x + 3.0, f.y + 3.0, false), Hit::Favorite(1));
         // … mit Vorschlägen liegen diese darüber und gewinnen.

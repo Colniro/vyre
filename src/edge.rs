@@ -59,6 +59,9 @@ pub struct EdgeShared {
     pub settings: crate::settings::Shared,
     /// Hosts, die Vyre auf HTTPS umgeleitet hat (gemeinsam mit den Servo-Tabs).
     pub upgraded: Rc<RefCell<std::collections::HashSet<String>>>,
+    pub downloads: crate::downloads::Downloads,
+    /// Laufende WebView2-Downloads (zum Pausieren, Fortsetzen, Abbrechen).
+    pub download_ops: RefCell<std::collections::HashMap<u64, ICoreWebView2DownloadOperation>>,
     /// Meldungen pro Tab-Nummer, abgeholt vom Hauptprogramm.
     pub events: RefCell<Vec<(u64, EdgeEvent)>>,
 }
@@ -156,6 +159,21 @@ impl EdgeRuntime {
             log::error!("WebView2-Laufzeit fehlt oder startet nicht: {e}");
             *self.env.borrow_mut() = EnvState::Failed;
         }
+    }
+
+    /// Pausiert, setzt fort oder bricht einen WebView2-Download ab.
+    pub fn download_control(&self, id: u64, op: &str) {
+        let ops = self.shared.download_ops.borrow();
+        let Some(d) = ops.get(&id) else { return };
+        // SAFETY: gültiges COM-Objekt auf dem UI-Thread.
+        let _ = unsafe {
+            match op {
+                "pause" => d.Pause(),
+                "resume" => d.Resume(),
+                "cancel" => d.Cancel(),
+                _ => Ok(()),
+            }
+        };
     }
 
     /// Legt einen Edge-Tab an. Er lädt `url`, sobald WebView2 bereit ist.
@@ -285,6 +303,78 @@ fn setup(
             })),
             &mut message_token,
         )?;
+        // Downloads: in den Downloads-Ordner, Edges eigene Download-Leiste ausblenden.
+        if let Ok(wv4) = webview.cast::<ICoreWebView2_4>() {
+            let sh = shared.clone();
+            let mut dl_token = 0i64;
+            wv4.add_DownloadStarting(
+                &DownloadStartingEventHandler::create(Box::new(move |_, args| {
+                    let Some(a) = args else { return Ok(()) };
+                    let op = a.DownloadOperation()?;
+                    let uri = read(|p| op.Uri(p));
+                    let suggested = read(|p| a.ResultFilePath(p));
+                    let name = std::path::Path::new(&suggested)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "download".into());
+                    let entry = sh.downloads.add_edge(&uri, &name);
+                    a.SetResultFilePath(&HSTRING::from(entry.path.as_os_str()))?;
+                    a.SetHandled(true)?;
+                    log::info!("Download (WebView2): {uri}");
+                    let id = entry.id;
+                    let report = {
+                        let sh = sh.clone();
+                        move |op: &ICoreWebView2DownloadOperation| {
+                            let (mut got, mut total) = (0i64, 0i64);
+                            let _ = op.BytesReceived(&mut got);
+                            let _ = op.TotalBytesToReceive(&mut total);
+                            let mut st = COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS;
+                            let _ = op.State(&mut st);
+                            let state = if st == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED {
+                                crate::downloads::State::Done
+                            } else if st == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED {
+                                let mut reason = COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_USER_CANCELED;
+                                let _ = op.InterruptReason(&mut reason);
+                                if reason == COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_USER_PAUSED {
+                                    crate::downloads::State::Paused
+                                } else if reason == COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_USER_CANCELED {
+                                    crate::downloads::State::Cancelled
+                                } else {
+                                    crate::downloads::State::Failed(format!("Abbruch ({})", reason.0))
+                                }
+                            } else {
+                                crate::downloads::State::Running
+                            };
+                            let total = (total > 0).then_some(total as u64);
+                            sh.downloads.update_edge(id, got.max(0) as u64, total, state);
+                        }
+                    };
+                    let report2 = report.clone();
+                    let mut t = 0i64;
+                    op.add_BytesReceivedChanged(
+                        &BytesReceivedChangedEventHandler::create(Box::new(move |op, _| {
+                            if let Some(op) = op {
+                                report(&op);
+                            }
+                            Ok(())
+                        })),
+                        &mut t,
+                    )?;
+                    op.add_StateChanged(
+                        &StateChangedEventHandler::create(Box::new(move |op, _| {
+                            if let Some(op) = op {
+                                report2(&op);
+                            }
+                            Ok(())
+                        })),
+                        &mut t,
+                    )?;
+                    sh.download_ops.borrow_mut().insert(id, op);
+                    Ok(())
+                })),
+                &mut dl_token,
+            )?;
+        }
         // Fingerprinting-Schutz vor den Skripten jeder Seite.
         webview.AddScriptToExecuteOnDocumentCreated(
             &HSTRING::from(crate::privacy::FINGERPRINT_SCRIPT),

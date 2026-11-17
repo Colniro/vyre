@@ -7,6 +7,7 @@
 mod blocker;
 #[cfg(windows)]
 mod edge;
+mod downloads;
 mod engine;
 mod history;
 mod importer;
@@ -46,6 +47,10 @@ pub enum UserEvent {
     BlockerReady,
     /// Import aus einem anderen Browser wurde auf vyre://passwoerter gestartet.
     Import(importer::Source),
+    /// Ein Download hat Fortschritt gemacht oder ist fertig.
+    DownloadsChanged,
+    /// Pausieren/Fortsetzen/Abbrechen auf vyre://downloads (für WebView2-Downloads im Hauptthread).
+    DownloadOp(u64, String),
 }
 
 /// So oft wird die FPS-Anzeige auch ohne andere Änderungen aufgefrischt.
@@ -140,6 +145,7 @@ struct Browser {
     blocker: Arc<blocker::Blocker>,
     history: Arc<history::Store>,
     vault: Arc<vault::Vault>,
+    downloads: downloads::Downloads,
     /// Abgeschicktes Login, das noch auf "Speichern?" wartet: Seite, Benutzername, Passwort.
     pending_save: Option<(String, String, String)>,
     /// Angepinnte Favoriten (Kopie aus der Datenbank, bei Änderungen neu gelesen).
@@ -183,6 +189,8 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ServoWake => b.spin(event_loop),
             UserEvent::BlockerReady => b.window.request_redraw(),
             UserEvent::Import(source) => b.run_import(source),
+            UserEvent::DownloadsChanged => b.window.request_redraw(),
+            UserEvent::DownloadOp(id, op) => b.engine.download_control(id, &op),
         }
     }
 
@@ -227,6 +235,12 @@ impl Browser {
         let vyre_dir = engine::profile_dir().parent().map(|p| p.to_path_buf()).unwrap_or_default();
         let history = Arc::new(history::Store::open(&vyre_dir.join("verlauf.sqlite")));
         let vault = Arc::new(vault::Vault::open(&vyre_dir.join("passwoerter.sqlite")));
+        let downloads = downloads::Downloads::new(downloads::downloads_dir(), Some(vyre_dir.join("downloads.json")), {
+            let proxy = proxy.clone();
+            move || {
+                let _ = proxy.send_event(UserEvent::DownloadsChanged);
+            }
+        });
         // Adresse von der Kommandozeile, sonst die Tabs vom letzten Mal, sonst ein neuer Tab.
         let keep_session = start.is_some();
         let restore = match start {
@@ -272,12 +286,24 @@ impl Browser {
 
         // Eigene Seiten unter vyre:// (Neuer Tab, Suche).
         let mut protocols = servo::protocol_handler::ProtocolRegistry::with_internal_protocols();
-        if let Err(e) = protocols.register("vyre", newtab::VyreProtocol::new(settings.clone(), history.clone(), vault.clone(), {
-            let proxy = proxy.clone();
-            move |source| {
-                let _ = proxy.send_event(UserEvent::Import(source));
-            }
-        })) {
+        if let Err(e) = protocols.register("vyre", newtab::VyreProtocol::new(
+            settings.clone(),
+            history.clone(),
+            vault.clone(),
+            {
+                let proxy = proxy.clone();
+                move |source| {
+                    let _ = proxy.send_event(UserEvent::Import(source));
+                }
+            },
+            downloads.clone(),
+            {
+                let proxy = proxy.clone();
+                move |id, op| {
+                    let _ = proxy.send_event(UserEvent::DownloadOp(id, op));
+                }
+            },
+        )) {
             log::error!("vyre:// nicht registriert: {e:?}");
         }
         let t = Instant::now();
@@ -291,6 +317,7 @@ impl Browser {
             protocols,
             history.clone(),
             settings.clone(),
+            downloads.clone(),
         )?;
         for url in urls {
             engine.new_tab(url);
@@ -315,6 +342,7 @@ impl Browser {
             favorites: history.favorites(),
             history,
             vault,
+            downloads,
             pending_save: None,
             saved_session: restore,
             keep_session,
@@ -485,6 +513,7 @@ impl Browser {
                 favorites: self.favorites.len(),
                 suggestions: if self.ui.url_focused { self.ui.suggestions.len() } else { 0 },
                 prompt: self.pending_save.is_some(),
+                downloads: self.downloads.sidebar().len(),
             },
         )
         .with_split(&self.engine.rows(), self.engine.ratio(), self.drop_side);
@@ -618,6 +647,18 @@ impl Browser {
                     self.focus_page();
                 }
             }
+        }
+    }
+
+    /// Wechselt zu einem Tab mit dieser vyre://-Seite oder öffnet sie neu.
+    fn open_page(&mut self, page: &str) {
+        let tabs = self.engine.tabs();
+        match tabs.iter().position(|t| t.url.as_ref().is_some_and(|u| u.as_str().starts_with(page))) {
+            Some(i) => {
+                self.select_tab(i);
+                self.engine.reload();
+            }
+            None => self.open_in_new_tab(page),
         }
     }
 
@@ -903,6 +944,13 @@ impl Browser {
                 }
                 self.relayout();
             }
+            Hit::Download(_) => self.open_page(newtab::DOWNLOADS_URL),
+            Hit::DownloadClose(i) => {
+                if let Some(d) = self.downloads.sidebar().get(i) {
+                    self.downloads.dismiss(d.id);
+                }
+                self.relayout();
+            }
             Hit::PwDismiss => {
                 self.pending_save = None;
                 self.relayout();
@@ -933,6 +981,7 @@ impl Browser {
             }
             Key::Character(c) if ctrl && char_is(c, "b") => self.toggle_sidebar(),
             Key::Character(c) if ctrl && char_is(c, "d") => self.toggle_favorite(),
+            Key::Character(c) if ctrl && !shift && char_is(c, "s") => self.engine.save_current(),
             // Aktiven Tab sofort schlafen legen.
             Key::Character(c) if ctrl && shift && char_is(c, "z") => {
                 self.engine.sleep_active();
@@ -1072,6 +1121,11 @@ impl Browser {
         };
         self.save_session(&tabs, active);
         let is_favorite = page.url.as_ref().is_some_and(|u| self.favorites.iter().any(|f| f.url == u.as_str()));
+        let sidebar_downloads = self.downloads.sidebar();
+        // Die Liste der Downloads in der Seitenleiste kann sich jederzeit ändern.
+        if sidebar_downloads.len() != self.layout.downloads.len() {
+            self.relayout();
+        }
         let prompt_host = self
             .pending_save
             .as_ref()
@@ -1082,6 +1136,7 @@ impl Browser {
             favorites: &self.favorites,
             is_favorite,
             save_prompt: prompt_host.as_ref().map(|(h, u)| (h.as_str(), u.as_str())),
+            downloads: &sidebar_downloads,
         };
         let mut frame = self.ui.build(self.renderer.font_system(), &self.layout, &view, &stats);
         // Weicher Schatten unter dem Seitenbereich.

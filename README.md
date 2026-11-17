@@ -26,6 +26,7 @@ Der erste Build dauert lange, weil Servo mitgebaut wird. SpiderMonkey wird ferti
 | Strg+1 … 8, Strg+9 | Zu Tab 1 … 8, zum letzten Tab |
 | Strg+B | Seitenleiste: fest ↔ beim Hovern ausfahren |
 | Strg+D | Seite als Favorit anpinnen / lösen |
+| Strg+S | Aktuelle Seite/Datei herunterladen |
 | Strg+Umschalt+E | Engine des Tabs wechseln (Servo ↔ WebView2) |
 | Strg+Umschalt+Z | Aktiven Tab schlafen legen |
 | Strg+H, Strg+Umschalt+Entf | Verlauf |
@@ -138,6 +139,18 @@ Die gelernten und festgelegten Seiten stehen in `%LOCALAPPDATA%\Vyre\engine-seit
   zusätzlich so, dass nur Chrome selbst sie lesen kann – die meldet der Import, dafür gibt es
   den CSV-Weg. Firefox/Zen mit Hauptpasswort: ebenfalls über CSV.
 
+## Downloads
+
+- Dateien landen ohne Nachfrage im Windows-Downloads-Ordner; gleiche Namen bekommen „(1)“ …
+- **WebView2-Tabs** nutzen die eingebauten Downloads (Edges eigene Leiste ist ausgeblendet).
+- **Servo-Tabs** kennen keine Downloads; Vyre lädt selbst herunter – mit den Cookies der
+  Seite, damit Downloads nach dem Anmelden klappen. Erkannt werden Dateien an der Endung
+  (`.zip`, `.exe`, `.pdf`, Videos …) und an `<a download>`-Links. **Strg+S** speichert, was im
+  Tab offen ist.
+- Laufende Downloads unten in der Seitenleiste mit Fortschrittsbalken; alle auf
+  `vyre://downloads` (pausieren, fortsetzen, abbrechen, öffnen, im Ordner zeigen).
+  Programme (`.exe`, `.msi` …) starten erst nach einer zweiten Bestätigung.
+
 ## Datenschutz
 
 - **Nur HTTPS**: Unverschlüsselte Adressen werden auf HTTPS umgeleitet (außer lokale wie
@@ -180,6 +193,7 @@ geladen. Das sind die einzigen Verbindungen, die Vyre von sich aus aufbaut.
 - `src/sites.rs`: welche Seite mit welcher Engine läuft
 - `src/privacy.rs`: Nur-HTTPS, Cookie-Aufräumen, Fingerprinting-Schutz, Kennung
 - `src/vault.rs`, `src/pwfill.rs`: Passwort-Tresor (DPAPI) und Ausfüllen in Seiten
+- `src/downloads.rs`: Downloads (eigener Downloader, WebView2-Anbindung, Übersicht)
 - `src/importer.rs`: Import aus Chrome/Edge/Brave, Firefox/Zen und CSV
 - `src/settings.rs`: gespeicherte Einstellungen
 - `src/render/`: GPU-Zeichnen (aus Wyven übernommen)

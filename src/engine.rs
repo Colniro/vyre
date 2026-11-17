@@ -35,6 +35,7 @@ use winit::window::{CursorIcon, Window, WindowId};
 use crate::UserEvent;
 use crate::blocker::{self, Blocker};
 use crate::edge::{self, EdgeEvent, EdgeRuntime, EdgeShared, EdgeView};
+use crate::downloads::{self, Downloads};
 use crate::history::Store;
 use crate::privacy;
 use crate::settings;
@@ -174,6 +175,10 @@ pub trait Engine {
     fn sleep_active(&mut self);
     /// Führt ein Skript in einem Tab aus (ohne auf das Ergebnis zu warten).
     fn eval_in(&self, tab: usize, script: &str);
+    /// Speichert, was im aktiven Tab offen ist, als Download (Strg+S).
+    fn save_current(&mut self);
+    /// Pausieren, Fortsetzen oder Abbrechen eines Downloads ("pause", "resume", "cancel").
+    fn download_control(&self, id: u64, op: &str);
     /// Zeigt `other` neben `target` (rechts oder links davon).
     fn split(&mut self, target: usize, other: usize, other_right: bool);
     /// Löst den Tab aus seiner geteilten Ansicht.
@@ -258,6 +263,9 @@ struct Shared {
     pending_css: RefCell<Vec<(WebView, String)>>,
     /// Nachrichten des Passwort-Skripts: WebView, Adresse der Seite, Nachricht.
     pw_messages: RefCell<Vec<(WebViewId, String, String)>>,
+    downloads: Downloads,
+    /// Downloads aus Servo-Tabs: Adresse, gewünschter Name, Seite (für Referer und Cookies).
+    download_requests: RefCell<Vec<(Url, Option<String>, Option<Url>)>>,
     /// Tabs, die zu WebView2 wechseln sollen.
     switch: RefCell<Vec<SwitchRequest>>,
     /// Ergebnis der Prüfung vor dem Einschlafen: Tab-Nummer und ob er wach bleiben muss.
@@ -352,6 +360,14 @@ impl WebViewDelegate for Delegate {
         if secured != request.url {
             request.deny();
             webview.load(secured);
+            return;
+        }
+        // Dateien, die Servo nicht anzeigen kann: herunterladen statt öffnen.
+        if downloads::looks_like_download(&request.url) {
+            let url = request.url.clone();
+            request.deny();
+            self.shared.download_requests.borrow_mut().push((url, None, webview.url()));
+            self.shared.main.request_redraw();
             return;
         }
         // Seiten, die WebView2 brauchen, gar nicht erst in Servo laden.
@@ -490,6 +506,13 @@ impl WebViewDelegate for Delegate {
 
     fn show_console_message(&self, webview: WebView, level: ConsoleLogLevel, message: String) {
         // Nachrichten des Passwort-Skripts: weiterreichen, nie ins Log schreiben (enthalten Passwörter).
+        if let Some((url, name)) = downloads::parse_message(&message) {
+            if let Ok(url) = webview.url().map_or_else(|| Url::parse(&url), |base| base.join(&url)) {
+                self.shared.download_requests.borrow_mut().push((url, name, webview.url()));
+                self.shared.main.request_redraw();
+            }
+            return;
+        }
         if message.starts_with(crate::pwfill::PREFIX) {
             if let Some(url) = webview.url() {
                 self.shared.pw_messages.borrow_mut().push((webview.id(), url.to_string(), message));
@@ -634,6 +657,7 @@ impl ServoEngine {
         protocols: ProtocolRegistry,
         history: Arc<Store>,
         settings: settings::Shared,
+        downloads: Downloads,
     ) -> Result<Self, String> {
         // Zwei Servo-Fenster: eines für normale Tabs, das zweite für die zweite Hälfte einer
         // geteilten Ansicht, wenn beide Hälften Servo-Seiten sind.
@@ -666,6 +690,7 @@ impl ServoEngine {
         let content = Rc::new(UserContentManager::new(&servo));
         content.add_script(Rc::new(UserScript::new(privacy::FINGERPRINT_SCRIPT.to_string(), None)));
         content.add_script(Rc::new(UserScript::new(crate::pwfill::PAGE_SCRIPT.to_string(), None)));
+        content.add_script(Rc::new(UserScript::new(downloads::PAGE_SCRIPT.to_string(), None)));
         let edge = EdgeRuntime::new(
             Rc::new(EdgeShared {
                 main: main.clone(),
@@ -673,6 +698,8 @@ impl ServoEngine {
                 blocker: blocker.clone(),
                 settings: settings.clone(),
                 upgraded: upgraded.clone(),
+                downloads: downloads.clone(),
+                download_ops: RefCell::default(),
                 events: RefCell::default(),
             }),
             vyre_dir.join("WebView2"),
@@ -687,6 +714,8 @@ impl ServoEngine {
             closed: RefCell::default(),
             pending_css: RefCell::default(),
             pw_messages: RefCell::default(),
+            downloads: downloads.clone(),
+            download_requests: RefCell::default(),
             switch: RefCell::default(),
             sleep_checks: Rc::default(),
             settings,
@@ -824,6 +853,23 @@ impl ServoEngine {
             let id = self.tabs[i].id;
             self.tabs[i].backend = self.backend_for(id, url, true, 0);
         }
+    }
+
+    /// Startet einen eigenen Download mit den Cookies der Adresse (damit Logins gelten).
+    fn start_download(&self, url: Url, name: Option<String>, page: Option<Url>) {
+        let mut headers = Vec::new();
+        if matches!(url.scheme(), "http" | "https") {
+            let cookies = self.servo.site_data_manager().cookies_for_url(url.clone(), servo::CookieSource::HTTP);
+            if !cookies.is_empty() {
+                let header: Vec<String> = cookies.iter().map(|c| format!("{}={}", c.name(), c.value())).collect();
+                headers.push(("Cookie".to_string(), header.join("; ")));
+            }
+            if let Some(p) = page.filter(|p| matches!(p.scheme(), "http" | "https")) {
+                headers.push(("Referer".to_string(), p.to_string()));
+            }
+        }
+        log::info!("Download: {url}");
+        self.shared.downloads.start(url, name, headers);
     }
 
     /// Lädt eine Adresse in einem Tab und wechselt dabei, wenn nötig, die Engine.
@@ -1121,6 +1167,10 @@ impl Engine for ServoEngine {
             }
         }
 
+        let requests: Vec<(Url, Option<String>, Option<Url>)> = self.shared.download_requests.borrow_mut().drain(..).collect();
+        for (url, name, page) in requests {
+            self.start_download(url, name, page);
+        }
         let pw: Vec<(WebViewId, String, String)> = self.shared.pw_messages.borrow_mut().drain(..).collect();
         for (wid, page, message) in pw {
             if let Some(tab) = self.tabs.iter().position(|t| t.servo().is_some_and(|w| w.id() == wid)) {
@@ -1273,6 +1323,27 @@ impl Engine for ServoEngine {
         }
     }
 
+    fn save_current(&mut self) {
+        let Some(url) = self.state().url.filter(|u| matches!(u.scheme(), "http" | "https")) else { return };
+        log::info!("Speichere {url}");
+        self.start_download(url, None, None);
+    }
+
+    fn download_control(&self, id: u64, op: &str) {
+        let Some(entry) = self.shared.downloads.get(id) else { return };
+        match entry.kind {
+            downloads::Kind::Edge => self.edge.download_control(id, op),
+            downloads::Kind::Own => {
+                match op {
+                    "pause" => self.shared.downloads.pause(id),
+                    "resume" => self.shared.downloads.resume(id),
+                    "cancel" => self.shared.downloads.cancel(id),
+                    _ => false,
+                };
+            }
+        }
+    }
+
     fn eval_in(&self, tab: usize, script: &str) {
         match self.tabs.get(tab).map(|t| &t.backend) {
             Some(Backend::Servo { webview, .. }) => webview.evaluate_javascript(script, |_| {}),
@@ -1323,6 +1394,11 @@ impl Engine for ServoEngine {
 
     fn load(&mut self, url: Url) {
         let url = self.shared.secure(url);
+        // Eine Datei, die Servo nicht anzeigen kann: gleich herunterladen.
+        if downloads::looks_like_download(&url) && self.tab().is_some_and(|t| t.servo().is_some()) {
+            self.start_download(url, None, self.state().url);
+            return;
+        }
         self.load_at(self.active, url);
     }
 

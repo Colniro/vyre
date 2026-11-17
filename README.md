@@ -37,6 +37,23 @@ Zwei Modi, umschaltbar mit dem Knopf oben in der Leiste oder Strg+B:
 Die Wahl steht in `%LOCALAPPDATA%\Vyre\einstellungen.txt`. Cookies und Seitenspeicher liegen in
 `%LOCALAPPDATA%\Vyre\Profil`.
 
+## Neuer Tab und Suche
+
+Neue Tabs (und der Start ohne Adresse) zeigen `vyre://neuer-tab`: ein Suchfeld und Kacheln
+für den Schnellzugriff. Kacheln lassen sich auf der Seite hinzufügen (`+`) und entfernen (`×`
+beim Hovern). Statt Favicons aus dem Netz zeigen sie einen farbigen Anfangsbuchstaben, damit die
+Seite ohne eine einzige Verbindung auskommt.
+
+Beim ersten Start fragt die Seite nach der Suchmaschine (DuckDuckGo, Brave Search, Startpage,
+Ecosia, Google). Ändern geht jederzeit über „ändern“ unter dem Suchfeld.
+
+**!Bangs** werden lokal aufgelöst, am Anfang oder Ende der Suche: `!yt`, `!w`/`!wde`
+(Wikipedia), `!gh`, `!g`, `!gi`, `!a` (Amazon), `!m` (OpenStreetMap), `!gm`, `!r`, `!so`,
+`!mdn`, `!rs` (docs.rs), `!crates`, `!rust`, `!npm`, `!py`, `!imdb`, `!leo`, `!dl` (DeepL),
+`!tr`, `!x`, `!ebay`, `!idealo`, `!db` und die Suchmaschinen selbst (`!ddg`, `!br`, `!sp`,
+`!e`, `!b`). Ein Bang ohne Suchbegriff öffnet die Startseite. Unbekannte Bangs gehen an
+DuckDuckGo, das tausende weitere kennt.
+
 ## Werbeblocker
 
 Eingebaut mit Braves [adblock-rust](https://github.com/brave/adblock-rust) und denselben
@@ -58,6 +75,8 @@ geladen. Das sind die einzigen Verbindungen, die Vyre von sich aus aufbaut.
 - `src/main.rs`: Fenster, Ereignisse, Fokus, Tastenkürzel, Ein-/Ausfahren der Seitenleiste
 - `src/ui.rs`: Layout, Seitenleiste mit Tab-Liste, Adressleiste, Animationen, FPS-Zähler
 - `src/engine.rs`: Engine-Schnittstelle `Engine` und die Servo-Anbindung (ein Kind-Fenster für alle Tabs)
+- `src/newtab.rs`: das `vyre://`-Protokoll (Neuer-Tab-Seite, Suche, Aktionen)
+- `src/search.rs`: Suchmaschinen und lokale !Bangs
 - `src/blocker.rs`: Werbeblocker (Filterlisten laden, Anfragen prüfen, Ausblend-Regeln)
 - `src/settings.rs`: gespeicherte Einstellungen
 - `src/render/`: GPU-Zeichnen (aus Wyven übernommen)

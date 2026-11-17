@@ -18,6 +18,7 @@ use servo::{
     WebViewDelegate, WebViewId, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
     WindowRenderingContext,
 };
+use servo::protocol_handler::ProtocolRegistry;
 use url::Url;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
@@ -60,7 +61,7 @@ fn strings(v: &JSValue) -> Vec<String> {
 }
 
 /// Text als JavaScript-String-Literal.
-fn js_string(s: &str) -> String {
+pub(crate) fn js_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
@@ -335,6 +336,7 @@ impl ServoEngine {
         bounds: (i32, i32, u32, u32),
         url: Url,
         blocker: Arc<Blocker>,
+        protocols: ProtocolRegistry,
     ) -> Result<Self, String> {
         let (x, y, w, h) = bounds;
         let parent = main.window_handle().map_err(|e| e.to_string())?.as_raw();
@@ -367,6 +369,7 @@ impl ServoEngine {
         };
         let servo = ServoBuilder::default()
             .opts(opts)
+            .protocol_registry(protocols)
             .event_loop_waker(Box::new(Waker(proxy)))
             .build();
 

@@ -7,7 +7,9 @@
 mod blocker;
 mod engine;
 mod keys;
+mod newtab;
 mod render;
+mod search;
 mod settings;
 mod ui;
 #[cfg(windows)]
@@ -18,7 +20,6 @@ use std::time::{Duration, Instant};
 
 use engine::{Engine, ServoEngine};
 use render::{RoundRect, Scene};
-use settings::Settings;
 use ui::{FpsCounter, Hit, Layout, SidebarMode, Stats, TabsView, THEME, Ui};
 use url::Url;
 use winit::application::ApplicationHandler;
@@ -36,8 +37,6 @@ pub enum UserEvent {
     BlockerReady,
 }
 
-const START_PAGE: &str = "https://servo.org/";
-const NEW_TAB_PAGE: &str = "about:blank";
 /// So oft wird die FPS-Anzeige auch ohne andere Änderungen aufgefrischt.
 const STATS_REFRESH: Duration = Duration::from_millis(500);
 /// So lange bleibt die ausgefahrene Seitenleiste stehen, nachdem die Maus sie verlassen hat.
@@ -53,17 +52,15 @@ fn main() {
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .expect("Ereignisschleife konnte nicht erstellt werden");
-    let start = std::env::args()
-        .nth(1)
-        .and_then(|a| ui::resolve_input(&a))
-        .unwrap_or_else(|| Url::parse(START_PAGE).expect("gültige Startseite"));
+    // Startadresse oder Suchbegriffe von der Kommandozeile; sonst die Neuer-Tab-Seite.
+    let start = std::env::args().nth(1);
     let mut app = App { proxy: event_loop.create_proxy(), start, browser: None };
     event_loop.run_app(&mut app).expect("Ereignisschleife");
 }
 
 struct App {
     proxy: EventLoopProxy<UserEvent>,
-    start: Url,
+    start: Option<String>,
     browser: Option<Browser>,
 }
 
@@ -128,7 +125,7 @@ struct Browser {
     ui: Ui,
     layout: Layout,
     sidebar: Sidebar,
-    settings: Settings,
+    settings: settings::Shared,
     blocker: Arc<blocker::Blocker>,
     modifiers: ModifiersState,
     cursor: (f32, f32),
@@ -198,13 +195,16 @@ fn to_bounds(r: ui::Rect) -> (i32, i32, u32, u32) {
 }
 
 impl Browser {
-    fn new(event_loop: &ActiveEventLoop, proxy: EventLoopProxy<UserEvent>, start: Url) -> Result<Self, String> {
-        let settings = Settings::load();
+    fn new(event_loop: &ActiveEventLoop, proxy: EventLoopProxy<UserEvent>, start: Option<String>) -> Result<Self, String> {
+        let settings = settings::Shared::load();
+        let start = start
+            .and_then(|a| search::resolve_input(&a, settings.get().search_engine.as_deref()))
+            .unwrap_or_else(|| Url::parse(newtab::NEW_TAB_URL).expect("gültige URL"));
         // Filterlisten so früh wie möglich im Hintergrund laden.
         let ready = proxy.clone();
         let blocker = blocker::Blocker::start(
             engine::profile_dir().parent().map(|p| p.join("Filter")).unwrap_or_default(),
-            settings.adblock_off.iter().cloned().collect(),
+            settings.get().adblock_off.iter().cloned().collect(),
             move || {
                 let _ = ready.send_event(UserEvent::BlockerReady);
             },
@@ -223,12 +223,17 @@ impl Browser {
         let mut renderer = pollster::block_on(render::Renderer::new(window.clone(), event_loop.owned_display_handle()));
         log::info!("GPU bereit nach {:?}: {:?}", t.elapsed(), renderer.gpu_info());
         let ui = Ui::new(renderer.font_system());
-        let sidebar = Sidebar::new(settings.sidebar);
+        let sidebar = Sidebar::new(settings.get().sidebar);
         let size = window.inner_size();
         let layout = Layout::new(size.width, size.height, window.scale_factor() as f32, sidebar.mode, sidebar.reveal, 1);
 
+        // Eigene Seiten unter vyre:// (Neuer Tab, Suche).
+        let mut protocols = servo::protocol_handler::ProtocolRegistry::with_internal_protocols();
+        if let Err(e) = protocols.register("vyre", newtab::VyreProtocol::new(settings.clone())) {
+            log::error!("vyre:// nicht registriert: {e:?}");
+        }
         let t = Instant::now();
-        let engine = ServoEngine::new(event_loop, window.clone(), proxy, to_bounds(layout.content), start, blocker.clone())?;
+        let engine = ServoEngine::new(event_loop, window.clone(), proxy, to_bounds(layout.content), start, blocker.clone(), protocols)?;
         log::info!("Servo bereit nach {:?}", t.elapsed());
 
         let refresh_hz = window
@@ -405,7 +410,7 @@ impl Browser {
     }
 
     fn new_tab(&mut self) {
-        self.engine.new_tab(Url::parse(NEW_TAB_PAGE).expect("gültige URL"));
+        self.engine.new_tab(Url::parse(newtab::NEW_TAB_URL).expect("gültige URL"));
         self.relayout();
         self.sidebar.show();
         self.focus_url();
@@ -437,15 +442,15 @@ impl Browser {
         let Some(host) = self.engine.state().url.and_then(|u| blocker::host_of(u.as_str())) else { return };
         let on = self.blocker.toggle(&host);
         log::info!("Werbeblocker auf {host}: {}", if on { "an" } else { "aus" });
-        self.settings.adblock_off = self.blocker.allowed_hosts();
-        self.settings.save();
+        let hosts = self.blocker.allowed_hosts();
+        self.settings.update(|s| s.adblock_off = hosts);
         self.engine.reload();
     }
 
     fn toggle_sidebar(&mut self) {
         self.sidebar.mode = self.sidebar.mode.toggled();
-        self.settings.sidebar = self.sidebar.mode;
-        self.settings.save();
+        let mode = self.sidebar.mode;
+        self.settings.update(|s| s.sidebar = mode);
         // Beim Wechsel zu "hover" bleibt die Leiste erst einmal stehen, bis die Maus geht.
         self.sidebar.reveal = 1.0;
         self.sidebar.show();
@@ -575,7 +580,8 @@ impl Browser {
         let field = &mut self.ui.url;
         match &event.logical_key {
             Key::Named(NamedKey::Enter) => {
-                if let Some(url) = ui::resolve_input(&field.text) {
+                let engine = self.settings.get().search_engine.clone();
+                if let Some(url) = search::resolve_input(&field.text, engine.as_deref()) {
                     self.engine.load(url);
                 }
                 self.focus_page();

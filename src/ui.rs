@@ -623,7 +623,7 @@ impl Ui {
     /// Text, den die Adressleiste ohne Fokus zeigt.
     pub fn display_url(page: &PageState) -> String {
         match &page.url {
-            Some(u) if u.scheme() == "about" => String::new(),
+            Some(u) if matches!(u.scheme(), "about" | "vyre") => String::new(),
             Some(u) => u.as_str().to_string(),
             None => String::new(),
         }
@@ -904,49 +904,9 @@ fn pretty_url(url: &str) -> String {
     s.strip_suffix('/').unwrap_or(s).to_string()
 }
 
-/// Macht aus einer Eingabe in der Adressleiste eine URL: Adresse oder Suche (mit !Bangs).
-pub fn resolve_input(input: &str) -> Option<url::Url> {
-    let input = input.trim();
-    if input.is_empty() {
-        return None;
-    }
-    let looks_like_url = !input.contains(' ')
-        && (input.contains("://")
-            || input.starts_with("localhost")
-            || input.starts_with("about:")
-            || (input.contains('.') && !input.starts_with('!') && !input.ends_with('.')));
-    if looks_like_url {
-        if let Ok(u) = url::Url::parse(input) {
-            if u.scheme().len() > 1 && (u.has_host() || u.scheme() == "about" || u.scheme() == "file") {
-                return Some(u);
-            }
-        }
-        // Lokale Entwicklungsserver laufen meist ohne HTTPS.
-        let scheme = if input.starts_with("localhost") || input.starts_with("127.0.0.1") { "http" } else { "https" };
-        if let Ok(u) = url::Url::parse(&format!("{scheme}://{input}")) {
-            return Some(u);
-        }
-    }
-    // Suche. DuckDuckGo löst !Bangs selbst auf; die Auswahl der Suchmaschine beim ersten Start
-    // und lokale !Bangs kommen in einem späteren Meilenstein.
-    let mut u = url::Url::parse("https://duckduckgo.com/").ok()?;
-    u.query_pairs_mut().append_pair("q", input);
-    Some(u)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn eingaben_werden_zu_urls() {
-        assert_eq!(resolve_input("servo.org").unwrap().as_str(), "https://servo.org/");
-        assert_eq!(resolve_input("https://a.b/c").unwrap().as_str(), "https://a.b/c");
-        assert_eq!(resolve_input("localhost:8080").unwrap().as_str(), "http://localhost:8080/");
-        assert!(resolve_input("rust lernen").unwrap().as_str().starts_with("https://duckduckgo.com/?q=rust+lernen"));
-        assert!(resolve_input("!yt katzen").unwrap().as_str().contains("q=%21yt+katzen"));
-        assert!(resolve_input("   ").is_none());
-    }
 
     #[test]
     fn textfeld_bearbeiten() {

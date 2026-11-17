@@ -122,6 +122,22 @@ Microsoft Edge, die in Windows 11 steckt), im selben Tab und Fenster. Man merkt 
 
 Die gelernten und festgelegten Seiten stehen in `%LOCALAPPDATA%\Vyre\engine-seiten.txt`.
 
+## Passwörter
+
+- **Tresor** in `%LOCALAPPDATA%\Vyre\passwoerter.sqlite`: jedes Passwort einzeln mit Windows
+  DPAPI verschlüsselt, also an dein Windows-Konto gebunden.
+- **Ausfüllen**: Klick in ein Benutzer- oder Passwortfeld zeigt die Konten für genau diese Seite;
+  ein Klick füllt aus. Die Seite bekommt erst dann das Passwort – und nur ihr eigenes.
+- **Speichern**: Nach dem Anmelden fragt eine Karte oben in der Seitenleiste „Passwort
+  speichern?“ (Speichern / Nie hier).
+- **Verwaltung** unter `vyre://passwoerter` (Link auf der Neuer-Tab-Seite): suchen, anzeigen,
+  löschen (zweimal klicken).
+- **Import** von Passwörtern, Lesezeichen (werden Favoriten) und Verlauf aus Chrome, Edge,
+  Brave, Firefox und Zen, oder Passwörter aus einer CSV-Datei (Export aus jedem Browser,
+  Bitwarden, 1Password, KeePass …). Neuere Chrome-Versionen schützen manche Passwörter
+  zusätzlich so, dass nur Chrome selbst sie lesen kann – die meldet der Import, dafür gibt es
+  den CSV-Weg. Firefox/Zen mit Hauptpasswort: ebenfalls über CSV.
+
 ## Datenschutz
 
 - **Nur HTTPS**: Unverschlüsselte Adressen werden auf HTTPS umgeleitet (außer lokale wie
@@ -163,6 +179,8 @@ geladen. Das sind die einzigen Verbindungen, die Vyre von sich aus aufbaut.
 - `src/edge.rs`: WebView2-Tabs (Abschottung, Werbeblocker, Cookies, Kürzel)
 - `src/sites.rs`: welche Seite mit welcher Engine läuft
 - `src/privacy.rs`: Nur-HTTPS, Cookie-Aufräumen, Fingerprinting-Schutz, Kennung
+- `src/vault.rs`, `src/pwfill.rs`: Passwort-Tresor (DPAPI) und Ausfüllen in Seiten
+- `src/importer.rs`: Import aus Chrome/Edge/Brave, Firefox/Zen und CSV
 - `src/settings.rs`: gespeicherte Einstellungen
 - `src/render/`: GPU-Zeichnen (aus Wyven übernommen)
 - `src/keys.rs`, `src/win.rs`: Tastenübersetzung, Windows-11-Fenstereffekte

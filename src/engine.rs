@@ -143,6 +143,8 @@ pub enum EngineEvent {
     Shortcut(Key, ModifiersState),
     /// Die Seite hat den Tastaturfokus bekommen.
     PageFocused,
+    /// Nachricht des Passwort-Skripts einer Seite (`origin` = Adresse des Tabs, nicht der Seite).
+    Password { tab: usize, page: String, message: String },
     /// Eine Seite will einen neuen Tab öffnen.
     OpenTab(Url),
 }
@@ -170,6 +172,8 @@ pub trait Engine {
     fn toggle_engine(&mut self);
     /// Legt den aktiven Tab sofort schlafen und wechselt zum vorher benutzten.
     fn sleep_active(&mut self);
+    /// Führt ein Skript in einem Tab aus (ohne auf das Ergebnis zu warten).
+    fn eval_in(&self, tab: usize, script: &str);
     /// Zeigt `other` neben `target` (rechts oder links davon).
     fn split(&mut self, target: usize, other: usize, other_right: bool);
     /// Löst den Tab aus seiner geteilten Ansicht.
@@ -252,6 +256,8 @@ struct Shared {
     closed: RefCell<Vec<WebViewId>>,
     /// CSS zum Ausblenden, das nach dem nächsten Servo-Durchlauf eingefügt wird.
     pending_css: RefCell<Vec<(WebView, String)>>,
+    /// Nachrichten des Passwort-Skripts: WebView, Adresse der Seite, Nachricht.
+    pw_messages: RefCell<Vec<(WebViewId, String, String)>>,
     /// Tabs, die zu WebView2 wechseln sollen.
     switch: RefCell<Vec<SwitchRequest>>,
     /// Ergebnis der Prüfung vor dem Einschlafen: Tab-Nummer und ob er wach bleiben muss.
@@ -482,7 +488,15 @@ impl WebViewDelegate for Delegate {
         self.shared.main.request_redraw();
     }
 
-    fn show_console_message(&self, _webview: WebView, level: ConsoleLogLevel, message: String) {
+    fn show_console_message(&self, webview: WebView, level: ConsoleLogLevel, message: String) {
+        // Nachrichten des Passwort-Skripts: weiterreichen, nie ins Log schreiben (enthalten Passwörter).
+        if message.starts_with(crate::pwfill::PREFIX) {
+            if let Some(url) = webview.url() {
+                self.shared.pw_messages.borrow_mut().push((webview.id(), url.to_string(), message));
+                self.shared.main.request_redraw();
+            }
+            return;
+        }
         if matches!(level, ConsoleLogLevel::Error) {
             self.js_errors.set(self.js_errors.get() + 1);
         }
@@ -651,6 +665,7 @@ impl ServoEngine {
         let upgraded: Rc<RefCell<HashSet<String>>> = Rc::default();
         let content = Rc::new(UserContentManager::new(&servo));
         content.add_script(Rc::new(UserScript::new(privacy::FINGERPRINT_SCRIPT.to_string(), None)));
+        content.add_script(Rc::new(UserScript::new(crate::pwfill::PAGE_SCRIPT.to_string(), None)));
         let edge = EdgeRuntime::new(
             Rc::new(EdgeShared {
                 main: main.clone(),
@@ -671,6 +686,7 @@ impl ServoEngine {
             opened: RefCell::default(),
             closed: RefCell::default(),
             pending_css: RefCell::default(),
+            pw_messages: RefCell::default(),
             switch: RefCell::default(),
             sleep_checks: Rc::default(),
             settings,
@@ -1105,6 +1121,12 @@ impl Engine for ServoEngine {
             }
         }
 
+        let pw: Vec<(WebViewId, String, String)> = self.shared.pw_messages.borrow_mut().drain(..).collect();
+        for (wid, page, message) in pw {
+            if let Some(tab) = self.tabs.iter().position(|t| t.servo().is_some_and(|w| w.id() == wid)) {
+                self.events.push(EngineEvent::Password { tab, page, message });
+            }
+        }
         let edge_events: Vec<(u64, EdgeEvent)> = self.edge.shared.events.borrow_mut().drain(..).collect();
         for (id, e) in edge_events {
             match e {
@@ -1116,6 +1138,11 @@ impl Engine for ServoEngine {
                         if i == self.active {
                             self.events.push(EngineEvent::PageFocused);
                         }
+                    }
+                }
+                EdgeEvent::Message(page, message) => {
+                    if let Some(tab) = self.index_of(id) {
+                        self.events.push(EngineEvent::Password { tab, page, message });
                     }
                 }
                 EdgeEvent::NoHttps(https) => {
@@ -1243,6 +1270,14 @@ impl Engine for ServoEngine {
         if let Some(p) = self.pair_of(id) {
             self.pairs[p].ratio = ratio.clamp(0.2, 0.8);
             self.apply_view();
+        }
+    }
+
+    fn eval_in(&self, tab: usize, script: &str) {
+        match self.tabs.get(tab).map(|t| &t.backend) {
+            Some(Backend::Servo { webview, .. }) => webview.evaluate_javascript(script, |_| {}),
+            Some(Backend::Edge(e)) => e.eval(script, |_| {}),
+            _ => {}
         }
     }
 

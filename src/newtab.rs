@@ -21,24 +21,35 @@ use servo::protocol_handler::{
 use url::Url;
 
 use crate::history::{self, Store};
+use crate::importer::Source;
+use crate::vault::Vault;
 use crate::search::{self, ENGINES};
 use crate::settings::{self, Tile};
 
 pub const NEW_TAB_URL: &str = "vyre://neuer-tab";
 pub const HISTORY_URL: &str = "vyre://verlauf";
+pub const PASSWORDS_URL: &str = "vyre://passwoerter";
 
 pub struct VyreProtocol {
     settings: settings::Shared,
     history: Arc<Store>,
+    vault: Arc<Vault>,
+    /// Weckt das Hauptprogramm für den Import (Dateiauswahl, Fortschritt).
+    import: Option<Box<dyn Fn(Source) + Send + Sync>>,
     token: String,
 }
 
 impl VyreProtocol {
-    pub fn new(settings: settings::Shared, history: Arc<Store>) -> Self {
+    pub fn new(
+        settings: settings::Shared,
+        history: Arc<Store>,
+        vault: Arc<Vault>,
+        import: impl Fn(Source) + Send + Sync + 'static,
+    ) -> Self {
         let a = RandomState::new().build_hasher().finish();
         let mut h = RandomState::new().build_hasher();
         h.write_u64(a ^ std::process::id() as u64);
-        Self { settings, history, token: format!("{a:016x}{:016x}", h.finish()) }
+        Self { settings, history, vault, import: Some(Box::new(import)), token: format!("{a:016x}{:016x}", h.finish()) }
     }
 
     /// Erzeugt das HTML für eine `vyre://`-Adresse.
@@ -48,6 +59,13 @@ impl VyreProtocol {
             "neuer-tab" => self.new_tab(),
             "verlauf" => self.history_page(&param("q").unwrap_or_default()),
             "kein-https" => self.no_https_page(&param("url").unwrap_or_default()),
+            "passwoerter" => {
+                // Anzeigen eines Passworts nur mit Schlüssel (also nur von der Seite selbst aus).
+                let reveal = param("zeige")
+                    .filter(|_| param("t").as_deref() == Some(self.token.as_str()))
+                    .and_then(|id| id.parse().ok());
+                self.passwords_page(&param("q").unwrap_or_default(), reveal, param("meldung").as_deref())
+            }
             "suche" => {
                 let q = param("q").unwrap_or_default();
                 let engine = self.settings.get().search_engine.clone();
@@ -70,6 +88,19 @@ impl VyreProtocol {
     /// Führt eine Aktion aus und liefert die Seite, zu der es danach zurückgeht.
     fn action(&self, path: &str, param: &dyn Fn(&str) -> Option<String>) -> String {
         match path {
+            "/passwort-weg" => {
+                if let Some(id) = param("id").and_then(|i| i.parse().ok()) {
+                    self.vault.delete(id);
+                }
+                return PASSWORDS_URL.into();
+            }
+            "/import" => {
+                let Some(source) = param("quelle").and_then(|q| Source::from_id(&q)) else { return PASSWORDS_URL.into() };
+                if let Some(start) = &self.import {
+                    start(source);
+                }
+                return format!("{PASSWORDS_URL}?meldung=Import%20aus%20{}%20l%C3%A4uft%20%E2%80%A6", source.name());
+            }
             "/http-erlauben" => {
                 // "Trotzdem öffnen": Ausnahme merken und die unverschlüsselte Seite laden.
                 let Some(url) = param("url").and_then(|u| Url::parse(&u).ok()).filter(|u| u.scheme() == "http") else {
@@ -129,6 +160,86 @@ impl VyreProtocol {
             other => log::warn!("unbekannte vyre-Aktion: {other}"),
         }
         NEW_TAB_URL.into()
+    }
+
+    /// Passwort-Verwaltung mit Import.
+    fn passwords_page(&self, query: &str, reveal: Option<i64>, message: Option<&str>) -> String {
+        let logins = self.vault.all(query);
+        let mut rows = String::new();
+        for l in &logins {
+            let host = l.origin.split("://").nth(1).unwrap_or(&l.origin);
+            let shown = if reveal == Some(l.id) {
+                self.vault.password(l.id).map(|p| format!("<code>{}</code>", esc(&p))).unwrap_or_else(|| "(nicht lesbar)".into())
+            } else {
+                "••••••••".into()
+            };
+            rows += &format!(
+                r#"<div class="entry"><div class="t">{host}</div><div class="u">{user}</div><div class="pw">{shown}</div><a class="btn" href="vyre://passwoerter?zeige={id}&t={token}">Anzeigen</a><button class="del" title="Löschen" data-id="{id}"></button></div>"#,
+                host = esc(host),
+                user = esc(if l.username.is_empty() { "(ohne Benutzername)" } else { &l.username }),
+                id = l.id,
+                token = self.token,
+            );
+        }
+        if logins.is_empty() {
+            rows = format!(
+                "<p class=\"empty\">{}</p>",
+                if query.is_empty() { "Noch keine Passwörter gespeichert. Importiere sie aus einem anderen Browser:" } else { "Nichts gefunden." }
+            );
+        }
+        let mut sources = String::new();
+        for s in Source::ALL.iter().filter(|s| s.available()) {
+            sources += &format!(r#"<button data-quelle="{}">{}</button>"#, s.id(), esc(s.name()));
+        }
+        let message = message.map(|m| format!(r#"<div class="msg">{}</div>"#, esc(m))).unwrap_or_default();
+        format!(
+            r##"<!doctype html>
+<html lang="de"><head><meta charset="utf-8"><title>Passwörter</title>
+<style>{CSS}{HISTORY_CSS}
+.entry {{ display: grid; grid-template-columns: 1.3fr 1fr 1fr auto auto; gap: 12px; }}
+.entry .t {{ font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+.entry .u, .entry .pw {{ font-size: 13px; color: #c8c8d4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+.entry code {{ color: #e8e8f0; font-family: Consolas, monospace; }}
+.btn {{ font-size: 12px; padding: 4px 10px; border-radius: 8px; background: #2d2d3a; color: #e8e8f0; }}
+.msg {{ margin: 12px 0; padding: 10px 14px; border-radius: 10px; background: #343248; color: #e8e8f0; font-size: 14px; }}
+.import {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 10px 0 18px; color: #8a8a9c; font-size: 14px; }}
+.import button {{ padding: 7px 13px; border-radius: 9px; border: 1.5px solid #2d2d3a; background: #21212b; color: #e8e8f0; font-size: 13px; cursor: pointer; }}
+.import button:hover {{ border-color: #9d8cff; }}
+</style></head>
+<body><div class="page">
+  <a href="#" class="back" id="back">← Zurück</a>
+  <h1>Passwörter</h1>
+  {message}
+  <div class="import"><span>Importieren aus:</span>{sources}</div>
+  <form method="get" action="vyre://passwoerter" autocomplete="off"><input name="q" value="{q}" placeholder="Passwörter durchsuchen"></form>
+  <h3>{count} gespeichert · mit deinem Windows-Konto verschlüsselt</h3>
+  {rows}
+</div>
+<script>
+var T = {token_js};
+function go(path, params) {{
+  var q = Object.keys(params).map(function (k) {{ return k + "=" + encodeURIComponent(params[k]); }}).join("&");
+  location.replace("vyre://aktion/" + path + "?t=" + T + (q ? "&" + q : ""));
+}}
+document.querySelectorAll(".del").forEach(function (b) {{
+  b.addEventListener("click", function () {{
+    if (b.dataset.armed) {{ go("passwort-weg", {{id: b.dataset.id}}); return; }}
+    b.dataset.armed = "1"; b.style.opacity = "1"; b.style.background = "#c42b1c";
+  }});
+}});
+document.getElementById("back").addEventListener("click", function (e) {{
+  e.preventDefault();
+  if (history.length > 1) history.back(); else location.replace("vyre://neuer-tab");
+}});
+document.querySelectorAll(".import button").forEach(function (b) {{
+  b.addEventListener("click", function () {{ go("import", {{quelle: b.dataset.quelle}}); }});
+}});
+</script>
+</body></html>"##,
+            q = esc(query),
+            count = self.vault.count(),
+            token_js = crate::engine::js_string(&self.token),
+        )
     }
 
     /// Warnseite: die Seite kann kein HTTPS.
@@ -206,6 +317,7 @@ document.getElementById("open").addEventListener("click", function () {{
 <html lang="de"><head><meta charset="utf-8"><title>Verlauf</title>
 <style>{CSS}{HISTORY_CSS}</style></head>
 <body><div class="page">
+  <a href="#" class="back" id="back">← Zurück</a>
   <h1>Verlauf</h1>
   <form method="get" action="vyre://verlauf" autocomplete="off"><input name="q" value="{q}" placeholder="Verlauf durchsuchen"></form>
   <div class="actions">
@@ -223,6 +335,10 @@ function go(path, params) {{
   var q = Object.keys(params).map(function (k) {{ return k + "=" + encodeURIComponent(params[k]); }}).join("&");
   location.replace("vyre://aktion/" + path + "?t=" + T + (q ? "&" + q : ""));
 }}
+document.getElementById("back").addEventListener("click", function (e) {{
+  e.preventDefault();
+  if (history.length > 1) history.back(); else location.replace("vyre://neuer-tab");
+}});
 document.querySelectorAll(".del").forEach(function (b) {{
   b.addEventListener("click", function () {{ go("verlauf-weg", {{url: b.dataset.url}}); }});
 }});
@@ -280,7 +396,7 @@ document.querySelectorAll(".actions button").forEach(function (b) {{
   <form id="search" autocomplete="off">
     <input id="q" name="q" placeholder="Mit {engine} suchen oder !Bang eingeben (!yt, !w, !gh …)">
   </form>
-  <div class="engine-line">Suchmaschine: {engine} · <a href="#" id="change">ändern</a> · <a href="vyre://verlauf">Verlauf</a></div>
+  <div class="engine-line">Suchmaschine: {engine} · <a href="#" id="change">ändern</a> · <a href="vyre://verlauf">Verlauf</a> · <a href="vyre://passwoerter">Passwörter</a></div>
   <div class="tiles">{tiles}
     <div class="tile add"><a href="#" id="add"><span class="icon plus">+</span><span class="name">Hinzufügen</span></a></div>
   </div>
@@ -449,7 +565,10 @@ h2 { margin: 0; font-size: 21px; font-weight: 600; }
 "#;
 
 const HISTORY_CSS: &str = r#"
-.page { max-width: 820px; margin: 0 auto; padding: 48px 24px; }
+.page { max-width: 820px; margin: 0 auto; padding: 28px 24px 48px; }
+.back { display: inline-block; margin-bottom: 14px; padding: 6px 12px; border-radius: 9px; background: #21212b;
+  color: #c8c8d4; font-size: 13px; }
+.back:hover { background: #2d2d3a; color: #e8e8f0; }
 h1 { font-size: 30px; font-weight: 600; margin: 0 0 20px; }
 h3 { margin: 28px 0 8px; font-size: 13px; font-weight: 600; color: #8a8a9c; text-transform: uppercase; letter-spacing: 0.5px; }
 .actions { display: flex; align-items: center; gap: 8px; margin: 14px 0 8px; color: #8a8a9c; font-size: 14px; flex-wrap: wrap; }
@@ -474,7 +593,13 @@ mod tests {
     use super::*;
 
     fn proto() -> VyreProtocol {
-        VyreProtocol { settings: settings::Shared::for_tests(), history: Arc::new(Store::in_memory()), token: "geheim".into() }
+        VyreProtocol {
+            settings: settings::Shared::for_tests(),
+            history: Arc::new(Store::in_memory()),
+            vault: Arc::new(Vault::in_memory()),
+            import: None,
+            token: "geheim".into(),
+        }
     }
 
     #[test]
@@ -522,6 +647,24 @@ mod tests {
         let out = p.page(&Url::parse("vyre://aktion/verlauf-loeschen?t=geheim&zeit=alles").unwrap());
         assert!(out.contains("vyre://verlauf"));
         assert!(p.page(&Url::parse("vyre://verlauf").unwrap()).contains("Der Verlauf ist leer."));
+    }
+
+    #[test]
+    fn passwort_seite() {
+        let p = proto();
+        p.vault.save("https://a.example", "anna", "Kennwort<1>");
+        let id = p.vault.all("")[0].id;
+        let html = p.page(&Url::parse("vyre://passwoerter").unwrap());
+        assert!(html.contains("a.example") && html.contains("anna"));
+        assert!(html.contains("← Zurück"));
+        assert!(!html.contains("Kennwort"));
+        // Anzeigen nur mit Schlüssel.
+        let fremd = p.page(&Url::parse(&format!("vyre://passwoerter?zeige={id}")).unwrap());
+        assert!(!fremd.contains("Kennwort"));
+        let eigen = p.page(&Url::parse(&format!("vyre://passwoerter?zeige={id}&t=geheim")).unwrap());
+        assert!(eigen.contains("Kennwort&lt;1&gt;"));
+        p.page(&Url::parse(&format!("vyre://aktion/passwort-weg?t=geheim&id={id}")).unwrap());
+        assert_eq!(p.vault.count(), 0);
     }
 
     #[test]

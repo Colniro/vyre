@@ -113,6 +113,10 @@ pub enum Hit {
     Favorite(usize),
     /// Vorschlag unter der Adressleiste.
     Suggestion(usize),
+    /// Karte "Passwort speichern?": speichern, nie für diese Seite, schließen.
+    PwSave,
+    PwNever,
+    PwDismiss,
     Tab(usize),
     TabClose(usize),
     NewTab,
@@ -154,6 +158,11 @@ pub struct Layout {
     pub shield: Rect,
     /// Stern zum Anpinnen, links neben dem Schild.
     pub star: Rect,
+    /// Karte "Passwort speichern?" mit ihren Knöpfen.
+    pub pw_card: Option<Rect>,
+    pub pw_save: Rect,
+    pub pw_never: Rect,
+    pub pw_close: Rect,
     /// Angepinnte Favoriten als kleine Quadrate unter der Adressleiste.
     pub favorites: Vec<Rect>,
     /// Vorschläge, schwebend unter der Adressleiste.
@@ -185,6 +194,8 @@ pub struct Counts {
     pub tabs: usize,
     pub favorites: usize,
     pub suggestions: usize,
+    /// Karte "Passwort speichern?" unter der Adressleiste.
+    pub prompt: bool,
 }
 
 const FAVS_PER_ROW: usize = 6;
@@ -213,7 +224,20 @@ impl Layout {
         let per_row = FAVS_PER_ROW;
         let fav_gap = FAV_GAP * s;
         let fav = ((sw - 2.0 * pad - (per_row - 1) as f32 * fav_gap) / per_row as f32).floor();
-        let fav_top = url.y + url.h + 10.0 * s;
+        let pw_card = counts.prompt.then(|| Rect { x: url.x, y: url.y + url.h + 10.0 * s, w: url.w, h: 96.0 * s });
+        let (pw_save, pw_never, pw_close) = match pw_card {
+            Some(c) => {
+                let bw = (c.w - 30.0 * s) / 2.0;
+                let by = c.y + c.h - 40.0 * s;
+                (
+                    Rect { x: c.x + 10.0 * s, y: by, w: bw, h: 30.0 * s },
+                    Rect { x: c.x + 20.0 * s + bw, y: by, w: bw, h: 30.0 * s },
+                    Rect { x: c.x + c.w - 30.0 * s, y: c.y + 6.0 * s, w: 24.0 * s, h: 24.0 * s },
+                )
+            }
+            None => Default::default(),
+        };
+        let fav_top = pw_card.map(|c| c.y + c.h).unwrap_or(url.y + url.h) + 10.0 * s;
         let favorites: Vec<Rect> = (0..counts.favorites)
             .map(|i| Rect {
                 x: sx + pad + (i % per_row) as f32 * (fav + fav_gap),
@@ -260,6 +284,10 @@ impl Layout {
             url,
             shield: Rect { x: url.x + url.w - 50.0 * s, y: url.y + 4.0 * s, w: 46.0 * s, h: url.h - 8.0 * s },
             star: Rect { x: url.x + url.w - 80.0 * s, y: url.y + 4.0 * s, w: 28.0 * s, h: url.h - 8.0 * s },
+            pw_card,
+            pw_save,
+            pw_never,
+            pw_close,
             favorites,
             suggestions,
             tabs_label,
@@ -355,6 +383,16 @@ impl Layout {
             for (i, r) in self.top.iter().enumerate() {
                 if r.contains(x, y) {
                     return TOP[i];
+                }
+            }
+            if let Some(card) = self.pw_card {
+                for (r, hit) in [(self.pw_close, Hit::PwDismiss), (self.pw_save, Hit::PwSave), (self.pw_never, Hit::PwNever)] {
+                    if r.contains(x, y) {
+                        return hit;
+                    }
+                }
+                if card.contains(x, y) {
+                    return Hit::Nothing;
                 }
             }
             if self.shield.contains(x, y) {
@@ -669,6 +707,7 @@ pub struct Ui {
     shield_icon: Label,
     shield_count: Label,
     star_icon: Label,
+    pw_labels: [Label; 5],
     fav_labels: Vec<Label>,
     sug_labels: Vec<SuggestionLabels>,
     /// Vorschläge zur aktuellen Eingabe; der erste ist das, was Enter ohne Auswahl tut.
@@ -722,6 +761,8 @@ pub struct TabsView<'a> {
     pub favorites: &'a [Favorite],
     /// Ist die Seite im aktiven Tab angepinnt?
     pub is_favorite: bool,
+    /// Karte "Passwort speichern?": Seite und Benutzername.
+    pub save_prompt: Option<(&'a str, &'a str)>,
 }
 
 fn paired(layout: &Layout, i: usize) -> Option<(usize, usize, Rect)> {
@@ -758,6 +799,7 @@ impl Ui {
             shield_icon: Label::new(fs),
             shield_count: Label::new(fs),
             star_icon: Label::new(fs),
+            pw_labels: [Label::new(fs), Label::new(fs), Label::new(fs), Label::new(fs), Label::new(fs)],
             fav_labels: Vec::new(),
             sug_labels: Vec::new(),
             suggestions: Vec::new(),
@@ -959,6 +1001,29 @@ impl Ui {
             cards.push(RoundRect::new(ur.x + 9.0 * s, ur.y + ur.h - 3.0 * s, w, 2.0 * s, t.accent, 1.0 * s));
         }
 
+        // Karte "Passwort speichern?".
+        if let (Some(c), Some((host, user))) = (layout.pw_card, tabs.save_prompt) {
+            cards.push(RoundRect::shadow(c.x, c.y, c.w, c.h, Rgba(0, 0, 0, 90), 10.0 * s, 6.0 * s));
+            cards.push(RoundRect::new(c.x, c.y, c.w, c.h, t.surface, 10.0 * s));
+            cards.push(RoundRect::outline(c.x, c.y, c.w, c.h, t.accent.with_alpha(150), 10.0 * s, 1.0 * s));
+            let sa = self.anim(Hit::PwSave);
+            let na = self.anim(Hit::PwNever);
+            let ca = self.anim(Hit::PwDismiss);
+            let (b1, b2, b3) = (layout.pw_save, layout.pw_never, layout.pw_close);
+            cards.push(RoundRect::new(b1.x, b1.y, b1.w, b1.h, lerp(t.accent, Rgba::rgb(255, 255, 255), sa * 0.15), 8.0 * s));
+            cards.push(RoundRect::new(b2.x, b2.y, b2.w, b2.h, lerp(t.bg, t.hover, 0.5 + na * 0.5), 8.0 * s));
+            if ca > 0.0 {
+                cards.push(RoundRect::new(b3.x, b3.y, b3.w, b3.h, t.hover.with_alpha((ca * 255.0) as u8), 6.0 * s));
+            }
+            let who = if user.is_empty() { host.to_string() } else { format!("{user} · {host}") };
+            let [title, detail, save, never, close] = &mut self.pw_labels;
+            title.set(fs, "Passwort speichern?", 13.0 * s, &self.ui_family, true);
+            detail.set(fs, &who, 11.5 * s, &self.ui_family, false);
+            save.set(fs, "Speichern", 12.5 * s, &self.ui_family, true);
+            never.set(fs, "Nie hier", 12.5 * s, &self.ui_family, false);
+            close.set(fs, ICON_CLOSE, 8.5 * s, &self.icon_family, false);
+        }
+
         // Angepinnte Favoriten: farbiges Quadrat mit Anfangsbuchstaben.
         while self.fav_labels.len() < tabs.favorites.len() {
             self.fav_labels.push(Label::new(fs));
@@ -1145,6 +1210,21 @@ impl Ui {
         for (i, l) in self.fav_labels.iter().enumerate() {
             text.push(centered(l, layout.favorites[i], Rgba::rgb(255, 255, 255)));
         }
+        if let (Some(c), Some(_)) = (layout.pw_card, tabs.save_prompt) {
+            let [title, detail, save, never, close] = &self.pw_labels;
+            let clip = Some([c.x.max(0.0) as i32, c.y as i32, (c.x + c.w - 34.0 * s).max(0.0) as i32, (c.y + c.h) as i32]);
+            text.push(TextBlock { buffer: &title.buffer, x: (c.x + 12.0 * s).round(), y: (c.y + 10.0 * s).round(), color: t.text, clip });
+            text.push(TextBlock {
+                buffer: &detail.buffer,
+                x: (c.x + 12.0 * s).round(),
+                y: (c.y + 12.0 * s + title.line_height()).round(),
+                color: t.dim,
+                clip,
+            });
+            text.push(centered(save, layout.pw_save, t.bg));
+            text.push(centered(never, layout.pw_never, t.text));
+            text.push(centered(close, layout.pw_close, t.dim));
+        }
         if show_shield {
             let sr = layout.shield;
             let (icon_color, count_color) = if stats.adblock_on { (t.accent, t.text) } else { (t.dim.with_alpha(140), t.dim) };
@@ -1326,13 +1406,13 @@ mod tests {
 
     #[test]
     fn favoriten_und_vorschlaege() {
-        let l = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 1.0, Counts { tabs: 2, favorites: 7, suggestions: 3 });
+        let l = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 1.0, Counts { tabs: 2, favorites: 7, suggestions: 3, prompt: false });
         // 6 Favoriten pro Reihe, der siebte rutscht in die zweite Reihe.
         assert_eq!(l.favorites[6].x, l.favorites[0].x);
         assert!(l.favorites[6].y > l.favorites[0].y);
         assert!(l.tabs_label.y > l.favorites[6].y + l.favorites[6].h);
         // Ohne Vorschläge trifft man den Favoriten …
-        let plain = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 1.0, Counts { tabs: 2, favorites: 7, suggestions: 0 });
+        let plain = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 1.0, Counts { tabs: 2, favorites: 7, suggestions: 0, prompt: false });
         let f = plain.favorites[1];
         assert_eq!(plain.hit(f.x + 3.0, f.y + 3.0, false), Hit::Favorite(1));
         // … mit Vorschlägen liegen diese darüber und gewinnen.

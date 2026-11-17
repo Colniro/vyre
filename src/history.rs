@@ -217,6 +217,39 @@ impl Store {
         }
     }
 
+    /// Pinnt eine Seite an, falls sie es noch nicht ist (Import von Lesezeichen).
+    pub fn add_favorite(&self, url: &str, title: &str) -> bool {
+        self.db()
+            .execute(
+                "INSERT OR IGNORE INTO favorites (url, title, pos) VALUES (?1, ?2, (SELECT COALESCE(MAX(pos), 0) + 1 FROM favorites))",
+                params![url, title],
+            )
+            .is_ok_and(|n| n > 0)
+    }
+
+    /// Übernimmt Verlauf aus einem anderen Browser; vorhandene Einträge behalten den höheren Wert.
+    pub fn import_visits(&self, visits: &[(String, String, i64, i64)]) -> usize {
+        let mut db = self.db();
+        let Ok(tx) = db.transaction() else { return 0 };
+        let mut n = 0;
+        for (url, title, count, last) in visits {
+            if !is_recordable(url) {
+                continue;
+            }
+            let r = tx.execute(
+                "INSERT INTO visits (url, title, count, last) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(url) DO UPDATE SET count = MAX(count, ?3), last = MAX(last, ?4),
+                     title = CASE WHEN title = '' THEN ?2 ELSE title END",
+                params![url, title, (*count).max(1), last],
+            );
+            if r.is_ok() {
+                n += 1;
+            }
+        }
+        let _ = tx.commit();
+        n
+    }
+
     pub fn remove_favorite(&self, url: &str) {
         let _ = self.db().execute("DELETE FROM favorites WHERE url = ?1", params![url]);
     }

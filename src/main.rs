@@ -9,15 +9,18 @@ mod blocker;
 mod edge;
 mod engine;
 mod history;
+mod importer;
 mod keys;
 mod newtab;
 mod privacy;
+mod pwfill;
 mod render;
 mod search;
 mod session;
 mod sites;
 mod settings;
 mod ui;
+mod vault;
 #[cfg(windows)]
 mod win;
 
@@ -41,6 +44,8 @@ pub enum UserEvent {
     ServoWake,
     /// Die Filterlisten des Werbeblockers sind geladen.
     BlockerReady,
+    /// Import aus einem anderen Browser wurde auf vyre://passwoerter gestartet.
+    Import(importer::Source),
 }
 
 /// So oft wird die FPS-Anzeige auch ohne andere Änderungen aufgefrischt.
@@ -134,6 +139,9 @@ struct Browser {
     settings: settings::Shared,
     blocker: Arc<blocker::Blocker>,
     history: Arc<history::Store>,
+    vault: Arc<vault::Vault>,
+    /// Abgeschicktes Login, das noch auf "Speichern?" wartet: Seite, Benutzername, Passwort.
+    pending_save: Option<(String, String, String)>,
     /// Angepinnte Favoriten (Kopie aus der Datenbank, bei Änderungen neu gelesen).
     favorites: Vec<history::Favorite>,
     /// Zuletzt gespeicherte Sitzung, damit nur bei Änderungen geschrieben wird.
@@ -174,6 +182,7 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::ServoWake => b.spin(event_loop),
             UserEvent::BlockerReady => b.window.request_redraw(),
+            UserEvent::Import(source) => b.run_import(source),
         }
     }
 
@@ -217,6 +226,7 @@ impl Browser {
         let settings = settings::Shared::load();
         let vyre_dir = engine::profile_dir().parent().map(|p| p.to_path_buf()).unwrap_or_default();
         let history = Arc::new(history::Store::open(&vyre_dir.join("verlauf.sqlite")));
+        let vault = Arc::new(vault::Vault::open(&vyre_dir.join("passwoerter.sqlite")));
         // Adresse von der Kommandozeile, sonst die Tabs vom letzten Mal, sonst ein neuer Tab.
         let keep_session = start.is_some();
         let restore = match start {
@@ -262,7 +272,12 @@ impl Browser {
 
         // Eigene Seiten unter vyre:// (Neuer Tab, Suche).
         let mut protocols = servo::protocol_handler::ProtocolRegistry::with_internal_protocols();
-        if let Err(e) = protocols.register("vyre", newtab::VyreProtocol::new(settings.clone(), history.clone())) {
+        if let Err(e) = protocols.register("vyre", newtab::VyreProtocol::new(settings.clone(), history.clone(), vault.clone(), {
+            let proxy = proxy.clone();
+            move |source| {
+                let _ = proxy.send_event(UserEvent::Import(source));
+            }
+        })) {
             log::error!("vyre:// nicht registriert: {e:?}");
         }
         let t = Instant::now();
@@ -299,6 +314,8 @@ impl Browser {
             blocker,
             favorites: history.favorites(),
             history,
+            vault,
+            pending_save: None,
             saved_session: restore,
             keep_session,
             modifiers: ModifiersState::empty(),
@@ -333,6 +350,7 @@ impl Browser {
                         self.relayout();
                     }
                 }
+                EngineEvent::Password { tab, page, message } => self.password_message(tab, &page, &message),
                 EngineEvent::OpenTab(url) => {
                     self.engine.new_tab(url);
                     self.relayout();
@@ -466,6 +484,7 @@ impl Browser {
                 tabs: self.engine.tabs().len(),
                 favorites: self.favorites.len(),
                 suggestions: if self.ui.url_focused { self.ui.suggestions.len() } else { 0 },
+                prompt: self.pending_save.is_some(),
             },
         )
         .with_split(&self.engine.rows(), self.engine.ratio(), self.drop_side);
@@ -607,6 +626,80 @@ impl Browser {
             self.engine.new_tab(url);
             self.relayout();
             self.focus_page();
+        }
+    }
+
+    /// Importiert Passwörter, Lesezeichen und Verlauf und zeigt das Ergebnis auf vyre://passwoerter.
+    fn run_import(&mut self, source: importer::Source) {
+        let report = match importer::import(source) {
+            Ok(data) => {
+                let mut saved = 0;
+                for (url, user, pass) in &data.logins {
+                    if let Some(origin) = vault::origin_of(url) {
+                        if self.vault.save(&origin, user, pass) {
+                            saved += 1;
+                        }
+                    }
+                }
+                let mut pinned = 0;
+                for (title, url) in &data.bookmarks {
+                    if history::is_recordable(url) && self.history.add_favorite(url, title) {
+                        pinned += 1;
+                    }
+                }
+                let visits = self.history.import_visits(&data.history);
+                self.favorites = self.history.favorites();
+                let mut text = format!(
+                    "Aus {} importiert: {saved} Passwörter, {pinned} Lesezeichen (als Favoriten), {visits} Verlaufseinträge.",
+                    source.name()
+                );
+                if data.skipped_passwords > 0 {
+                    text += &format!(
+                        " {} Passwörter ließen sich nicht lesen (der Browser schützt sie zusätzlich) – exportiere sie dort als CSV und importiere die Datei.",
+                        data.skipped_passwords
+                    );
+                }
+                for note in &data.notes {
+                    text += &format!(" {note}.");
+                }
+                log::info!("{text}");
+                text
+            }
+            Err(e) => format!("Import aus {} nicht möglich: {e}", source.name()),
+        };
+        let mut url = Url::parse(newtab::PASSWORDS_URL).expect("gültige URL");
+        url.query_pairs_mut().append_pair("meldung", &report);
+        self.engine.load(url);
+        self.relayout();
+    }
+
+    /// Nachricht des Passwort-Skripts einer Seite: Konten anzeigen, ausfüllen oder Speichern anbieten.
+    fn password_message(&mut self, tab: usize, page: &str, message: &str) {
+        // Die Seite bestimmt Vyre selbst aus der Adresse des Tabs.
+        let Some(origin) = vault::origin_of(page) else { return };
+        match pwfill::parse(message) {
+            Some(pwfill::Message::Focus) => {
+                let logins = self.vault.logins_for(&origin);
+                if !logins.is_empty() {
+                    self.engine.eval_in(tab, &pwfill::show_script(&logins));
+                }
+            }
+            Some(pwfill::Message::Fill(id)) => {
+                // Nur Konten genau dieser Seite.
+                let Some(login) = self.vault.get(id).filter(|l| l.origin == origin) else { return };
+                if let Some(pass) = self.vault.password(id) {
+                    self.engine.eval_in(tab, &pwfill::fill_script(&login.username, &pass));
+                }
+            }
+            Some(pwfill::Message::Submit { username, password }) => {
+                if self.vault.is_never(&origin) || self.vault.has_exact(&origin, &username, &password) {
+                    return;
+                }
+                self.pending_save = Some((origin, username, password));
+                self.sidebar.show();
+                self.relayout();
+            }
+            None => {}
         }
     }
 
@@ -796,6 +889,24 @@ impl Browser {
             Hit::Shield => self.toggle_adblock(),
             Hit::Tab(i) => self.select_tab(i),
             Hit::Star => self.toggle_favorite(),
+            Hit::PwSave => {
+                if let Some((origin, user, pass)) = self.pending_save.take() {
+                    if self.vault.save(&origin, &user, &pass) {
+                        log::info!("Passwort für {origin} gespeichert");
+                    }
+                }
+                self.relayout();
+            }
+            Hit::PwNever => {
+                if let Some((origin, _, _)) = self.pending_save.take() {
+                    self.vault.never_save(&origin);
+                }
+                self.relayout();
+            }
+            Hit::PwDismiss => {
+                self.pending_save = None;
+                self.relayout();
+            }
             Hit::Favorite(i) => self.open_favorite(i),
             Hit::Suggestion(i) => self.open_suggestion(i),
             _ => {}
@@ -961,7 +1072,17 @@ impl Browser {
         };
         self.save_session(&tabs, active);
         let is_favorite = page.url.as_ref().is_some_and(|u| self.favorites.iter().any(|f| f.url == u.as_str()));
-        let view = TabsView { tabs: &tabs, active, favorites: &self.favorites, is_favorite };
+        let prompt_host = self
+            .pending_save
+            .as_ref()
+            .map(|(o, u, _)| (o.split("://").nth(1).unwrap_or(o).to_string(), u.clone()));
+        let view = TabsView {
+            tabs: &tabs,
+            active,
+            favorites: &self.favorites,
+            is_favorite,
+            save_prompt: prompt_host.as_ref().map(|(h, u)| (h.as_str(), u.as_str())),
+        };
         let mut frame = self.ui.build(self.renderer.font_system(), &self.layout, &view, &stats);
         // Weicher Schatten unter dem Seitenbereich.
         let c = self.layout.content;

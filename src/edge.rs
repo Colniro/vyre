@@ -47,6 +47,8 @@ pub enum EdgeEvent {
     OpenTab(String),
     /// HTTPS ist nach Vyres Umleitung gescheitert (Adresse mit https).
     NoHttps(String),
+    /// Nachricht des Passwort-Skripts: Adresse der Seite, Nachricht.
+    Message(String, String),
 }
 
 /// Gemeinsamer Zustand aller Edge-Tabs.
@@ -263,6 +265,26 @@ fn setup(
                 let _ = p3.SetPreferredTrackingPreventionLevel(COREWEBVIEW2_TRACKING_PREVENTION_LEVEL_STRICT);
             }
         }
+        // Passwort-Skript: Vorschläge beim Klick in Login-Felder, Logins erkennen.
+        webview.AddScriptToExecuteOnDocumentCreated(
+            &HSTRING::from(crate::pwfill::PAGE_SCRIPT),
+            &AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(|_, _| Ok(()))),
+        )?;
+        let mut message_token = 0i64;
+        let sh = shared.clone();
+        webview.add_WebMessageReceived(
+            &WebMessageReceivedEventHandler::create(Box::new(move |sender, args| {
+                let (Some(wv), Some(a)) = (sender, args) else { return Ok(()) };
+                let message = read(|p| a.TryGetWebMessageAsString(p));
+                if message.starts_with(crate::pwfill::PREFIX) {
+                    let page = read(|p| wv.Source(p));
+                    sh.events.borrow_mut().push((id, EdgeEvent::Message(page, message)));
+                    sh.main.request_redraw();
+                }
+                Ok(())
+            })),
+            &mut message_token,
+        )?;
         // Fingerprinting-Schutz vor den Skripten jeder Seite.
         webview.AddScriptToExecuteOnDocumentCreated(
             &HSTRING::from(crate::privacy::FINGERPRINT_SCRIPT),

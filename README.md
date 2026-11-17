@@ -122,6 +122,18 @@ Microsoft Edge, die in Windows 11 steckt), im selben Tab und Fenster. Man merkt 
 
 Die gelernten und festgelegten Seiten stehen in `%LOCALAPPDATA%\Vyre\engine-seiten.txt`.
 
+## Datenschutz
+
+- **Nur HTTPS**: Unverschlüsselte Adressen werden auf HTTPS umgeleitet (außer lokale wie
+  `localhost`, `192.168.…` oder Namen ohne Punkt). Kann eine Seite kein HTTPS, zeigt Vyre eine
+  Warnseite; „Trotzdem öffnen“ merkt sich die Ausnahme (`http_erlaubt` in
+  `einstellungen.txt`). Unverschlüsselte Seiten zeigen in der Adressleiste ein rotes Warnsymbol.
+- **Drittanbieter-Cookies**: Alle 5 Minuten löscht Vyre Cookies von Seiten, die du nie selbst
+  besucht hast (Tracker). WebView2 läuft zusätzlich mit seinem strengen Tracking-Schutz.
+- **Fingerprinting**: Ein Skript vor jeder Seite liefert einheitliche Werte (4 Kerne, 8 GB,
+  übliche Bildschirmgröße) und verrauscht das Auslesen von Canvas und Audio minimal.
+- **Kennung**: Vyre meldet sich als Firefox ESR statt als (seltenes, gut wiedererkennbares) Servo.
+
 ## Werbeblocker
 
 Eingebaut mit Braves [adblock-rust](https://github.com/brave/adblock-rust) und denselben
@@ -150,6 +162,7 @@ geladen. Das sind die einzigen Verbindungen, die Vyre von sich aus aufbaut.
 - `src/session.rs`: offene Tabs speichern und wiederherstellen
 - `src/edge.rs`: WebView2-Tabs (Abschottung, Werbeblocker, Cookies, Kürzel)
 - `src/sites.rs`: welche Seite mit welcher Engine läuft
+- `src/privacy.rs`: Nur-HTTPS, Cookie-Aufräumen, Fingerprinting-Schutz, Kennung
 - `src/settings.rs`: gespeicherte Einstellungen
 - `src/render/`: GPU-Zeichnen (aus Wyven übernommen)
 - `src/keys.rs`, `src/win.rs`: Tastenübersetzung, Windows-11-Fenstereffekte

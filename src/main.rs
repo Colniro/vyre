@@ -11,6 +11,7 @@ mod engine;
 mod history;
 mod keys;
 mod newtab;
+mod privacy;
 mod render;
 mod search;
 mod session;
@@ -137,6 +138,8 @@ struct Browser {
     favorites: Vec<history::Favorite>,
     /// Zuletzt gespeicherte Sitzung, damit nur bei Änderungen geschrieben wird.
     saved_session: session::Session,
+    /// Mit einer Adresse gestartet: die gespeicherte Sitzung nicht überschreiben.
+    keep_session: bool,
     modifiers: ModifiersState,
     cursor: (f32, f32),
     ui_fps: FpsCounter,
@@ -215,6 +218,7 @@ impl Browser {
         let vyre_dir = engine::profile_dir().parent().map(|p| p.to_path_buf()).unwrap_or_default();
         let history = Arc::new(history::Store::open(&vyre_dir.join("verlauf.sqlite")));
         // Adresse von der Kommandozeile, sonst die Tabs vom letzten Mal, sonst ein neuer Tab.
+        let keep_session = start.is_some();
         let restore = match start {
             Some(arg) => session::Session {
                 urls: search::resolve_input(&arg, settings.get().search_engine.as_deref())
@@ -271,6 +275,7 @@ impl Browser {
             blocker.clone(),
             protocols,
             history.clone(),
+            settings.clone(),
         )?;
         for url in urls {
             engine.new_tab(url);
@@ -295,6 +300,7 @@ impl Browser {
             favorites: history.favorites(),
             history,
             saved_session: restore,
+            keep_session,
             modifiers: ModifiersState::empty(),
             cursor: (0.0, 0.0),
             ui_fps: FpsCounter::default(),
@@ -606,6 +612,9 @@ impl Browser {
 
     /// Speichert die offenen Tabs, wenn sie sich geändert haben.
     fn save_session(&mut self, tabs: &[engine::PageState], active: usize) {
+        if self.keep_session {
+            return;
+        }
         let now = session::Session {
             urls: tabs.iter().filter_map(|t| t.url.as_ref().map(|u| u.to_string())).collect(),
             active,

@@ -47,6 +47,7 @@ impl VyreProtocol {
         match url.host_str().unwrap_or("") {
             "neuer-tab" => self.new_tab(),
             "verlauf" => self.history_page(&param("q").unwrap_or_default()),
+            "kein-https" => self.no_https_page(&param("url").unwrap_or_default()),
             "suche" => {
                 let q = param("q").unwrap_or_default();
                 let engine = self.settings.get().search_engine.clone();
@@ -60,31 +61,46 @@ impl VyreProtocol {
                     log::warn!("vyre://aktion ohne gültigen Schlüssel abgelehnt: {url}");
                     return message("Diese Aktion ist nur von der Neuer-Tab-Seite aus erlaubt.");
                 }
-                redirect(self.action(url.path(), &param))
+                redirect(&self.action(url.path(), &param))
             }
             _ => message("Diese Vyre-Seite gibt es nicht."),
         }
     }
 
     /// Führt eine Aktion aus und liefert die Seite, zu der es danach zurückgeht.
-    fn action(&self, path: &str, param: &dyn Fn(&str) -> Option<String>) -> &'static str {
+    fn action(&self, path: &str, param: &dyn Fn(&str) -> Option<String>) -> String {
         match path {
+            "/http-erlauben" => {
+                // "Trotzdem öffnen": Ausnahme merken und die unverschlüsselte Seite laden.
+                let Some(url) = param("url").and_then(|u| Url::parse(&u).ok()).filter(|u| u.scheme() == "http") else {
+                    return NEW_TAB_URL.into();
+                };
+                if let Some(host) = url.host_str().map(|h| h.trim_start_matches("www.").to_ascii_lowercase()) {
+                    log::info!("HTTP-Ausnahme für {host}");
+                    self.settings.update(|s| {
+                        if !s.http_allowed.contains(&host) {
+                            s.http_allowed.push(host);
+                        }
+                    });
+                }
+                return url.to_string();
+            }
             "/verlauf-loeschen" => {
                 let seconds = match param("zeit").as_deref() {
                     Some("stunde") => Some(3600),
                     Some("tag") => Some(86400),
                     Some("woche") => Some(7 * 86400),
                     Some("alles") => None,
-                    _ => return HISTORY_URL,
+                    _ => return HISTORY_URL.into(),
                 };
                 self.history.delete_recent(seconds);
-                return HISTORY_URL;
+                return HISTORY_URL.into();
             }
             "/verlauf-weg" => {
                 if let Some(url) = param("url") {
                     self.history.delete_url(&url);
                 }
-                return HISTORY_URL;
+                return HISTORY_URL.into();
             }
             "/suchmaschine" => {
                 if let Some(id) = param("id").filter(|id| ENGINES.iter().any(|e| e.id == id)) {
@@ -94,7 +110,7 @@ impl VyreProtocol {
             "/kachel-neu" => {
                 let raw = param("url").unwrap_or_default();
                 // Nur echte Adressen, keine Suchbegriffe.
-                let Some(url) = search::resolve_input(&raw, None).filter(|u| !is_search(u, &raw)) else { return NEW_TAB_URL };
+                let Some(url) = search::resolve_input(&raw, None).filter(|u| !is_search(u, &raw)) else { return NEW_TAB_URL.into() };
                 let title = param("titel")
                     .map(|t| t.trim().to_string())
                     .filter(|t| !t.is_empty())
@@ -112,7 +128,46 @@ impl VyreProtocol {
             }
             other => log::warn!("unbekannte vyre-Aktion: {other}"),
         }
-        NEW_TAB_URL
+        NEW_TAB_URL.into()
+    }
+
+    /// Warnseite: die Seite kann kein HTTPS.
+    fn no_https_page(&self, http_url: &str) -> String {
+        let host = Url::parse(http_url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
+        format!(
+            r##"<!doctype html>
+<html lang="de"><head><meta charset="utf-8"><title>Keine sichere Verbindung</title>
+<style>{CSS}{HISTORY_CSS}
+.warn {{ max-width: 620px; margin: 14vh auto 0; padding: 0 24px; }}
+.warn h1 {{ color: #ff8a7a; }}
+.warn p {{ color: #c8c8d4; line-height: 1.55; }}
+.warn .row {{ justify-content: flex-start; margin-top: 22px; }}
+</style></head>
+<body><div class="warn">
+  <h1>Keine sichere Verbindung</h1>
+  <p><b>{host}</b> bietet kein HTTPS an. Wenn du die Seite trotzdem öffnest, ist alles, was du dort
+  siehst oder eingibst, unverschlüsselt – andere im selben Netz (z.&nbsp;B. öffentliches WLAN)
+  könnten mitlesen oder Inhalte verändern.</p>
+  <p>Gib dort keine Passwörter oder persönlichen Daten ein.</p>
+  <div class="row">
+    <button type="button" class="primary" id="back">Zurück</button>
+    <button type="button" id="open">Trotzdem öffnen</button>
+  </div>
+</div>
+<script>
+var T = {token_js};
+document.getElementById("back").addEventListener("click", function () {{
+  if (history.length > 1) history.back(); else location.replace("{NEW_TAB_URL}");
+}});
+document.getElementById("open").addEventListener("click", function () {{
+  location.replace("vyre://aktion/http-erlauben?t=" + T + "&url=" + encodeURIComponent({url_js}));
+}});
+</script>
+</body></html>"##,
+            host = esc(&host),
+            token_js = crate::engine::js_string(&self.token),
+            url_js = crate::engine::js_string(http_url),
+        )
     }
 
     fn history_page(&self, query: &str) -> String {
@@ -467,6 +522,19 @@ mod tests {
         let out = p.page(&Url::parse("vyre://aktion/verlauf-loeschen?t=geheim&zeit=alles").unwrap());
         assert!(out.contains("vyre://verlauf"));
         assert!(p.page(&Url::parse("vyre://verlauf").unwrap()).contains("Der Verlauf ist leer."));
+    }
+
+    #[test]
+    fn http_ausnahme() {
+        let p = proto();
+        let html = p.page(&Url::parse("vyre://kein-https?url=http%3A%2F%2Falt.example%2Fx").unwrap());
+        assert!(html.contains("<b>alt.example</b>"));
+        let out = p.page(&Url::parse("vyre://aktion/http-erlauben?t=geheim&url=http%3A%2F%2Falt.example%2Fx").unwrap());
+        assert!(out.contains("http://alt.example/x"));
+        assert_eq!(p.settings.get().http_allowed, ["alt.example"]);
+        // Nur http-Adressen, keine anderen Schemata.
+        p.page(&Url::parse("vyre://aktion/http-erlauben?t=geheim&url=file%3A%2F%2F%2Fc%3A%2F").unwrap());
+        assert_eq!(p.settings.get().http_allowed.len(), 1);
     }
 
     #[test]

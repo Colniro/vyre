@@ -29,6 +29,8 @@ pub struct Settings {
     /// Gewählte Suchmaschine (`None`: noch nicht gewählt, dann fragt die Neuer-Tab-Seite).
     pub search_engine: Option<String>,
     pub tiles: Vec<Tile>,
+    /// Seiten ohne HTTPS, die man trotzdem öffnen wollte.
+    pub http_allowed: Vec<String>,
 }
 
 fn default_tiles() -> Vec<Tile> {
@@ -49,6 +51,7 @@ impl Default for Settings {
             adblock_off: Vec::new(),
             search_engine: None,
             tiles: default_tiles(),
+            http_allowed: Vec::new(),
         }
     }
 }
@@ -90,6 +93,13 @@ impl Settings {
                         .collect();
                 }
                 "suchmaschine" if !value.is_empty() => s.search_engine = Some(value.to_string()),
+                "http_erlaubt" => {
+                    s.http_allowed = value
+                        .split(',')
+                        .map(|h| h.trim().to_string())
+                        .filter(|h| !h.is_empty())
+                        .collect();
+                }
                 "kacheln" => tiles_set = true,
                 "kachel" => {
                     if let Some((title, url)) = value.split_once('|') {
@@ -112,6 +122,8 @@ impl Settings {
         t += &format!("suchmaschine = {}\n", self.search_engine.as_deref().unwrap_or(""));
         t += "# Seiten ohne Werbeblocker, mit Komma getrennt\n";
         t += &format!("werbeblocker_aus = {}\n", self.adblock_off.join(", "));
+        t += "# Seiten ohne HTTPS, die trotzdem geöffnet werden dürfen\n";
+        t += &format!("http_erlaubt = {}\n", self.http_allowed.join(", "));
         t += "# Kacheln der Neuer-Tab-Seite: kachel = Titel | Adresse\nkacheln = eigene\n";
         for tile in &self.tiles {
             t += &format!("kachel = {} | {}\n", tile.title.replace('|', "/"), tile.url);
@@ -180,12 +192,14 @@ mod tests {
             adblock_off: vec!["a.de".into(), "b.com".into()],
             search_engine: Some("brave".into()),
             tiles: vec![Tile::new("A | B", "https://a.de/")],
+            http_allowed: vec!["alt.de".into()],
         };
         let back = Settings::parse(&s.to_text());
         assert_eq!(back.sidebar, SidebarMode::Hover);
         assert_eq!(back.adblock_off, ["a.de", "b.com"]);
         assert_eq!(back.search_engine.as_deref(), Some("brave"));
         assert_eq!(back.tiles, [Tile::new("A / B", "https://a.de/")]);
+        assert_eq!(back.http_allowed, ["alt.de"]);
     }
 
     #[test]

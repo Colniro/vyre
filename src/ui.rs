@@ -612,6 +612,7 @@ const ICON_CLOSE: &str = "\u{E8BB}";
 const ICON_LOCK: &str = "\u{E72E}";
 const ICON_GLOBE: &str = "\u{E774}";
 const ICON_ADD: &str = "\u{E710}";
+const ICON_WARNING: &str = "\u{E7BA}";
 const ICON_SHIELD: &str = "\u{EA18}";
 const ICON_STAR: &str = "\u{E734}";
 const ICON_STAR_FILLED: &str = "\u{E735}";
@@ -887,7 +888,10 @@ impl Ui {
             cards.push(RoundRect::outline(ur.x, ur.y, ur.w, ur.h, t.accent.with_alpha(170), 9.0 * s, 1.5 * s));
         }
         let secure = page.url.as_ref().is_some_and(|u| u.scheme() == "https");
-        self.url_icon.set(fs, if secure { ICON_LOCK } else { ICON_GLOBE }, 11.0 * s, &self.icon_family, false);
+        // Unverschlüsselte Seite: Warnsymbol statt Schloss.
+        let insecure = page.url.as_ref().is_some_and(|u| u.scheme() == "http");
+        let url_icon = if secure { ICON_LOCK } else if insecure { ICON_WARNING } else { ICON_GLOBE };
+        self.url_icon.set(fs, url_icon, 11.0 * s, &self.icon_family, false);
 
         let (url_text, url_color) = if self.url_focused {
             (self.url.text.clone(), t.text)
@@ -1114,7 +1118,14 @@ impl Ui {
             color,
             clip: Some(side_clip),
         };
-        text.push(left_icon(&self.url_icon, ur, if secure { t.dim } else { t.dim.with_alpha(160) }));
+        let url_icon_color = if secure {
+            t.dim
+        } else if page.url.as_ref().is_some_and(|u| u.scheme() == "http") {
+            Rgba::rgb(0xff, 0x8a, 0x7a)
+        } else {
+            t.dim.with_alpha(160)
+        };
+        text.push(left_icon(&self.url_icon, ur, url_icon_color));
         text.push(TextBlock {
             buffer: &self.url_label.buffer,
             x: text_left - self.url_scroll,

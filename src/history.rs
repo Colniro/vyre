@@ -172,6 +172,19 @@ impl Store {
         let _ = self.db().execute_batch("VACUUM;");
     }
 
+    /// Alle Hosts, die man selbst besucht hat (für das Wegräumen von Drittanbieter-Cookies).
+    pub fn visited_hosts(&self) -> std::collections::HashSet<String> {
+        let db = self.db();
+        let Ok(mut stmt) = db.prepare("SELECT url FROM visits") else { return Default::default() };
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .map(|rows| {
+                rows.filter_map(Result::ok)
+                    .filter_map(|u| url::Url::parse(&u).ok()?.host_str().map(|h| h.to_ascii_lowercase()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn delete_url(&self, url: &str) {
         let _ = self.db().execute("DELETE FROM visits WHERE url = ?1", params![url]);
     }

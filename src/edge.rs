@@ -45,6 +45,8 @@ pub enum EdgeEvent {
     Focused,
     /// Die Seite will einen neuen Tab öffnen.
     OpenTab(String),
+    /// HTTPS ist nach Vyres Umleitung gescheitert (Adresse mit https).
+    NoHttps(String),
 }
 
 /// Gemeinsamer Zustand aller Edge-Tabs.
@@ -52,6 +54,9 @@ pub struct EdgeShared {
     pub main: Arc<Window>,
     pub history: Arc<Store>,
     pub blocker: Arc<Blocker>,
+    pub settings: crate::settings::Shared,
+    /// Hosts, die Vyre auf HTTPS umgeleitet hat (gemeinsam mit den Servo-Tabs).
+    pub upgraded: Rc<RefCell<std::collections::HashSet<String>>>,
     /// Meldungen pro Tab-Nummer, abgeholt vom Hauptprogramm.
     pub events: RefCell<Vec<(u64, EdgeEvent)>>,
 }
@@ -252,6 +257,17 @@ fn setup(
         if let Ok(s) = settings.cast::<ICoreWebView2Settings8>() {
             s.SetIsReputationCheckingRequired(false)?;
         }
+        // Strenger Tracking-Schutz für das WebView2-Profil.
+        if let Ok(profile) = webview.cast::<ICoreWebView2_13>().and_then(|w| w.Profile()) {
+            if let Ok(p3) = profile.cast::<ICoreWebView2Profile3>() {
+                let _ = p3.SetPreferredTrackingPreventionLevel(COREWEBVIEW2_TRACKING_PREVENTION_LEVEL_STRICT);
+            }
+        }
+        // Fingerprinting-Schutz vor den Skripten jeder Seite.
+        webview.AddScriptToExecuteOnDocumentCreated(
+            &HSTRING::from(crate::privacy::FINGERPRINT_SCRIPT),
+            &AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(|_, _| Ok(()))),
+        )?;
 
         let mut token = 0i64;
 
@@ -309,7 +325,22 @@ fn setup(
         )?;
         let (st, sh) = (state.clone(), shared.clone());
         webview.add_NavigationStarting(
-            &NavigationStartingEventHandler::create(Box::new(move |_, _| {
+            &NavigationStartingEventHandler::create(Box::new(move |sender, args| {
+                // Nur HTTPS: unverschlüsselte Adressen umleiten.
+                if let (Some(wv), Some(a)) = (sender, args) {
+                    let uri = read(|p| a.Uri(p));
+                    if let Ok(url) = Url::parse(&uri) {
+                        let allowed = sh.settings.get().http_allowed.clone();
+                        if let Some(https) = crate::privacy::upgrade(&url, &allowed) {
+                            if let Some(h) = https.host_str() {
+                                sh.upgraded.borrow_mut().insert(h.to_string());
+                            }
+                            a.SetCancel(true)?;
+                            wv.Navigate(&HSTRING::from(https.as_str()))?;
+                            return Ok(());
+                        }
+                    }
+                }
                 st.borrow_mut().loading = true;
                 sh.main.request_redraw();
                 Ok(())
@@ -318,9 +349,24 @@ fn setup(
         )?;
         let (st, sh) = (state.clone(), shared.clone());
         webview.add_NavigationCompleted(
-            &NavigationCompletedEventHandler::create(Box::new(move |sender, _| {
+            &NavigationCompletedEventHandler::create(Box::new(move |sender, args| {
                 st.borrow_mut().loading = false;
                 sh.main.request_redraw();
+                // HTTPS nach Umleitung gescheitert: Warnseite.
+                if let (Some(wv), Some(a)) = (&sender, &args) {
+                    let mut ok = BOOL(1);
+                    let _ = a.IsSuccess(&mut ok);
+                    if !ok.as_bool() {
+                        let src = read(|p| wv.Source(p));
+                        if let Ok(url) = Url::parse(&src) {
+                            let upgraded = url.host_str().is_some_and(|h| sh.upgraded.borrow().contains(h));
+                            if url.scheme() == "https" && upgraded {
+                                sh.events.borrow_mut().push((id, EdgeEvent::NoHttps(src)));
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
                 if let Some(wv) = sender {
                     hide_ads(&wv, &sh.blocker);
                 }

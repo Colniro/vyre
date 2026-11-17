@@ -9,6 +9,7 @@
 //! Festlegungen von Hand. Scheitert eine Seite in Servo, wechselt der Tab still zu WebView2.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -19,7 +20,7 @@ use servo::protocol_handler::ProtocolRegistry;
 use servo::{
     ConsoleLogLevel, CreateNewWebViewRequest, Cursor, DevicePoint, EventLoopWaker, InputEvent, JSValue,
     LoadStatus, MouseButton, MouseButtonAction, MouseButtonEvent, MouseLeftViewportEvent, MouseMoveEvent,
-    NavigationRequest, Opts, RenderingContext, Servo, ServoBuilder, WebResourceLoad, WebResourceResponse,
+    NavigationRequest, Opts, Preferences, StorageType, UserContentManager, UserScript, RenderingContext, Servo, ServoBuilder, WebResourceLoad, WebResourceResponse,
     WebView, WebViewBuilder, WebViewDelegate, WebViewId, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
     WindowRenderingContext,
 };
@@ -35,6 +36,8 @@ use crate::UserEvent;
 use crate::blocker::{self, Blocker};
 use crate::edge::{self, EdgeEvent, EdgeRuntime, EdgeShared, EdgeView};
 use crate::history::Store;
+use crate::privacy;
+use crate::settings;
 use crate::sites::{self, Choice, Sites};
 use crate::ui::FpsCounter;
 
@@ -66,6 +69,8 @@ const PROBE_PAGE: &str = "(function(){var b=document.body;if(!b)return [0,0,fals
 
 /// Nach so langer Zeit ohne Benutzung schläft ein Tab ein.
 const SLEEP_AFTER: Duration = Duration::from_secs(10 * 60);
+/// So oft werden Cookies von Seiten weggeräumt, die man nie selbst besucht hat.
+const COOKIE_CLEANUP_EVERY: Duration = Duration::from_secs(5 * 60);
 /// So oft wird nach Tabs gesucht, die einschlafen können.
 const SLEEP_CHECK_EVERY: Duration = Duration::from_secs(30);
 
@@ -251,6 +256,36 @@ struct Shared {
     switch: RefCell<Vec<SwitchRequest>>,
     /// Ergebnis der Prüfung vor dem Einschlafen: Tab-Nummer und ob er wach bleiben muss.
     sleep_checks: Rc<RefCell<Vec<(u64, bool)>>>,
+    settings: settings::Shared,
+    /// Hosts, die Vyre selbst auf HTTPS umgeleitet hat (für die Warnseite, wenn HTTPS scheitert).
+    upgraded: Rc<RefCell<HashSet<String>>>,
+    /// Nutzer-Skripte (Fingerprinting-Schutz) für alle Servo-Tabs.
+    content: Rc<UserContentManager>,
+}
+
+impl Shared {
+    /// Leitet auf HTTPS um, außer bei lokalen Adressen und erlaubten Ausnahmen.
+    fn secure(&self, url: Url) -> Url {
+        let allowed = self.settings.get().http_allowed.clone();
+        match privacy::upgrade(&url, &allowed) {
+            Some(https) => {
+                if let Some(h) = https.host_str() {
+                    self.upgraded.borrow_mut().insert(h.to_string());
+                }
+                https
+            }
+            None => url,
+        }
+    }
+}
+
+/// Adresse der Warnseite, wenn eine Seite kein HTTPS kann.
+pub(crate) fn no_https_page(https: &Url) -> Option<Url> {
+    let mut http = https.clone();
+    http.set_scheme("http").ok()?;
+    let mut page = Url::parse("vyre://kein-https").ok()?;
+    page.query_pairs_mut().append_pair("url", http.as_str());
+    Some(page)
 }
 
 impl Shared {
@@ -306,6 +341,13 @@ impl WebViewDelegate for Delegate {
     }
 
     fn request_navigation(&self, webview: WebView, request: NavigationRequest) {
+        // Nur HTTPS: unverschlüsselte Adressen auf HTTPS umleiten.
+        let secured = self.shared.secure(request.url.clone());
+        if secured != request.url {
+            request.deny();
+            webview.load(secured);
+            return;
+        }
         // Seiten, die WebView2 brauchen, gar nicht erst in Servo laden.
         if self.shared.sites.borrow().choice(&request.url) == Choice::Edge {
             let url = request.url.clone();
@@ -326,6 +368,16 @@ impl WebViewDelegate for Delegate {
     fn notify_page_title_changed(&self, webview: WebView, title: Option<String>) {
         if let (Some(url), Some(t)) = (webview.url(), title.as_deref()) {
             self.shared.history.set_title(url.as_str(), t);
+        }
+        // HTTPS ist gescheitert, nachdem Vyre umgeleitet hat: Warnseite mit "Trotzdem öffnen".
+        if title.as_deref() == Some(privacy::SERVO_ERROR_TITLE) {
+            if let Some(url) = webview.url().filter(|u| u.scheme() == "https") {
+                let upgraded = url.host_str().is_some_and(|h| self.shared.upgraded.borrow().contains(h));
+                if let Some(page) = no_https_page(&url).filter(|_| upgraded) {
+                    log::info!("{url} kann kein HTTPS, zeige Warnseite");
+                    webview.load(page);
+                }
+            }
         }
         self.state.borrow_mut().title = title;
         self.changed(&webview);
@@ -417,6 +469,7 @@ impl WebViewDelegate for Delegate {
         let surface = &shared.surfaces[0];
         let webview = request
             .builder(surface.context.clone())
+            .user_content_manager(shared.content.clone())
             .hidpi_scale_factor(Scale::new(surface.window.scale_factor() as f32))
             .delegate(delegate.clone())
             .build();
@@ -529,6 +582,8 @@ pub struct ServoEngine {
     next_sleep_check: Instant,
     /// Tabs, deren Prüfung vor dem Einschlafen noch läuft.
     sleep_pending: Vec<u64>,
+    /// Nächstes Wegräumen von Drittanbieter-Cookies.
+    next_cookie_cleanup: Instant,
 }
 
 /// Erstellt ein Kind-Fenster mit OpenGL-Kontext, in das Servo zeichnet.
@@ -564,6 +619,7 @@ impl ServoEngine {
         blocker: Arc<Blocker>,
         protocols: ProtocolRegistry,
         history: Arc<Store>,
+        settings: settings::Shared,
     ) -> Result<Self, String> {
         // Zwei Servo-Fenster: eines für normale Tabs, das zweite für die zweite Hälfte einer
         // geteilten Ansicht, wenn beide Hälften Servo-Seiten sind.
@@ -582,17 +638,26 @@ impl ServoEngine {
             hard_fail: false,
             ..Default::default()
         };
+        // Unauffällige Kennung (Firefox) statt "Servo".
+        let mut prefs = Preferences::default();
+        prefs.user_agent = privacy::USER_AGENT.to_string();
         let servo = ServoBuilder::default()
             .opts(opts)
+            .preferences(prefs)
             .protocol_registry(protocols)
             .event_loop_waker(Box::new(Waker(proxy)))
             .build();
 
+        let upgraded: Rc<RefCell<HashSet<String>>> = Rc::default();
+        let content = Rc::new(UserContentManager::new(&servo));
+        content.add_script(Rc::new(UserScript::new(privacy::FINGERPRINT_SCRIPT.to_string(), None)));
         let edge = EdgeRuntime::new(
             Rc::new(EdgeShared {
                 main: main.clone(),
                 history: history.clone(),
                 blocker: blocker.clone(),
+                settings: settings.clone(),
+                upgraded: upgraded.clone(),
                 events: RefCell::default(),
             }),
             vyre_dir.join("WebView2"),
@@ -608,6 +673,9 @@ impl ServoEngine {
             pending_css: RefCell::default(),
             switch: RefCell::default(),
             sleep_checks: Rc::default(),
+            settings,
+            upgraded,
+            content,
         });
         let mut engine = Self {
             tabs: Vec::new(),
@@ -623,6 +691,7 @@ impl ServoEngine {
             fps: RefCell::new(FpsCounter::default()),
             events: Vec::new(),
             next_sleep_check: Instant::now() + SLEEP_CHECK_EVERY,
+            next_cookie_cleanup: Instant::now() + COOKIE_CLEANUP_EVERY,
             sleep_pending: Vec::new(),
         };
         engine.new_tab(url);
@@ -661,6 +730,7 @@ impl ServoEngine {
         let delegate = Delegate::new(&self.shared, Some(url.clone()), surface);
         let s = &self.shared.surfaces[surface];
         let webview = WebViewBuilder::new(&self.servo, s.context.clone())
+            .user_content_manager(self.shared.content.clone())
             .url(url)
             .hidpi_scale_factor(Scale::new(s.window.scale_factor() as f32))
             .delegate(delegate.clone())
@@ -737,6 +807,47 @@ impl ServoEngine {
             log::info!("Tab wacht auf: {url}");
             let id = self.tabs[i].id;
             self.tabs[i].backend = self.backend_for(id, url, true, 0);
+        }
+    }
+
+    /// Lädt eine Adresse in einem Tab und wechselt dabei, wenn nötig, die Engine.
+    fn load_at(&mut self, index: usize, url: Url) {
+        let Some(tab) = self.tabs.get(index) else { return };
+        let want = self.shared.sites.borrow().choice(&url);
+        match (&tab.backend, want) {
+            (Backend::Servo { webview, .. }, Choice::Servo) => webview.load(url),
+            (Backend::Edge(e), Choice::Edge) if !self.edge.failed() => e.load(&url),
+            (Backend::Servo { webview, .. }, Choice::Edge) if self.edge.failed() => webview.load(url),
+            _ => {
+                // Andere Engine nötig: Tab umbauen.
+                let surface = tab.surface().unwrap_or(0);
+                let visible = self.view().iter().any(|(i, _)| *i == index);
+                let backend = self.backend_for(tab.id, url, visible, surface);
+                self.replace_backend(index, backend);
+            }
+        }
+    }
+
+    /// Löscht Cookies von Seiten, die man nie selbst besucht hat (Tracker als Drittanbieter).
+    fn cleanup_cookies(&mut self) {
+        let now = Instant::now();
+        if now < self.next_cookie_cleanup {
+            return;
+        }
+        self.next_cookie_cleanup = now + COOKIE_CLEANUP_EVERY;
+        let manager = self.servo.site_data_manager();
+        let sites: Vec<String> = manager.site_data(StorageType::Cookies).iter().map(|s| s.name()).collect();
+        let mut visited = self.shared.history.visited_hosts();
+        for t in &self.tabs {
+            if let Some(h) = t.state().url.as_ref().and_then(|u| u.host_str()) {
+                visited.insert(h.to_ascii_lowercase());
+            }
+        }
+        let third = privacy::third_party_sites(&sites, &visited);
+        if !third.is_empty() {
+            log::info!("Drittanbieter-Cookies weggeräumt: {}", third.join(", "));
+            let refs: Vec<&str> = third.iter().map(String::as_str).collect();
+            manager.clear_site_data(&refs, StorageType::Cookies);
         }
     }
 
@@ -976,6 +1087,7 @@ impl Engine for ServoEngine {
         self.run_probes();
         let mut changed = self.handle_switches();
         self.check_sleep();
+        self.cleanup_cookies();
 
         let opened: Vec<(WebView, Rc<Delegate>)> = self.shared.opened.borrow_mut().drain(..).collect();
         let closed: Vec<WebViewId> = self.shared.closed.borrow_mut().drain(..).collect();
@@ -1004,6 +1116,12 @@ impl Engine for ServoEngine {
                         if i == self.active {
                             self.events.push(EngineEvent::PageFocused);
                         }
+                    }
+                }
+                EdgeEvent::NoHttps(https) => {
+                    // HTTPS in einem WebView2-Tab gescheitert: Warnseite (läuft in Servo).
+                    if let (Some(i), Some(page)) = (self.index_of(id), Url::parse(&https).ok().and_then(|u| no_https_page(&u))) {
+                        self.load_at(i, page);
                     }
                 }
                 EdgeEvent::OpenTab(u) => {
@@ -1057,6 +1175,7 @@ impl Engine for ServoEngine {
     }
 
     fn new_tab(&mut self, url: Url) {
+        let url = self.shared.secure(url);
         let id = self.new_id();
         let backend = self.backend_for(id, url, true, 0);
         self.insert(Tab::new(id, backend));
@@ -1168,19 +1287,8 @@ impl Engine for ServoEngine {
     }
 
     fn load(&mut self, url: Url) {
-        let Some(tab) = self.tab() else { return };
-        let want = self.shared.sites.borrow().choice(&url);
-        match (&tab.backend, want) {
-            (Backend::Servo { webview, .. }, Choice::Servo) => webview.load(url),
-            (Backend::Edge(e), Choice::Edge) if !self.edge.failed() => e.load(&url),
-            (Backend::Servo { webview, .. }, Choice::Edge) if self.edge.failed() => webview.load(url),
-            _ => {
-                // Andere Engine nötig: Tab umbauen.
-                let surface = tab.surface().unwrap_or(0);
-                let backend = self.backend_for(tab.id, url, true, surface);
-                self.replace_backend(self.active, backend);
-            }
-        }
+        let url = self.shared.secure(url);
+        self.load_at(self.active, url);
     }
 
     fn reload(&self) {

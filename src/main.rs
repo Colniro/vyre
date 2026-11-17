@@ -5,6 +5,8 @@
 //! Die Tastatur bleibt beim Hauptfenster und wird je nach Fokus an die Seite weitergereicht.
 
 mod blocker;
+#[cfg(windows)]
+mod edge;
 mod engine;
 mod history;
 mod keys;
@@ -12,6 +14,7 @@ mod newtab;
 mod render;
 mod search;
 mod session;
+mod sites;
 mod settings;
 mod ui;
 #[cfg(windows)]
@@ -20,7 +23,7 @@ mod win;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use engine::{Engine, ServoEngine};
+use engine::{Engine, EngineEvent, ServoEngine};
 use render::{RoundRect, Scene};
 use ui::{Counts, FpsCounter, Hit, Layout, SidebarMode, Stats, Suggestion, SuggestionKind, TabsView, THEME, Ui};
 use url::Url;
@@ -159,10 +162,10 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         let Some(b) = &mut self.browser else { return };
         match event {
-            UserEvent::ServoWake => b.spin(),
+            UserEvent::ServoWake => b.spin(event_loop),
             UserEvent::BlockerReady => b.window.request_redraw(),
         }
     }
@@ -174,7 +177,7 @@ impl ApplicationHandler<UserEvent> for App {
         } else {
             b.main_window_event(event_loop, event);
         }
-        b.spin();
+        b.spin(event_loop);
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -298,9 +301,30 @@ impl Browser {
         })
     }
 
-    fn spin(&mut self) {
+    fn spin(&mut self, event_loop: &ActiveEventLoop) {
         if self.engine.spin() {
             self.relayout();
+        }
+        for event in self.engine.take_events() {
+            match event {
+                // Kürzel aus einem WebView2-Tab: wie im Hauptfenster behandeln.
+                EngineEvent::Shortcut(key, mods) => {
+                    let saved = std::mem::replace(&mut self.modifiers, mods);
+                    self.shortcut(event_loop, &key);
+                    self.modifiers = saved;
+                }
+                EngineEvent::PageFocused => {
+                    if self.ui.url_focused {
+                        self.ui.url_focused = false;
+                        self.ui.suggestions.clear();
+                        self.relayout();
+                    }
+                }
+                EngineEvent::OpenTab(url) => {
+                    self.engine.new_tab(url);
+                    self.relayout();
+                }
+            }
         }
     }
 
@@ -448,6 +472,9 @@ impl Browser {
         self.ui.url.select_all();
         self.ui.url_focused = true;
         self.engine.set_focused(false);
+        // Aus einem WebView2-Tab den Tastaturfokus zurückholen.
+        #[cfg(windows)]
+        win::take_focus(&self.window);
         self.window.request_redraw();
     }
 
@@ -708,6 +735,11 @@ impl Browser {
             }
             Key::Character(c) if ctrl && char_is(c, "b") => self.toggle_sidebar(),
             Key::Character(c) if ctrl && char_is(c, "d") => self.toggle_favorite(),
+            // Notausgang: Engine des Tabs von Hand wechseln (Servo <-> WebView2).
+            Key::Character(c) if ctrl && shift && char_is(c, "e") => {
+                self.engine.toggle_engine();
+                self.relayout();
+            }
             Key::Character(c) if ctrl && char_is(c, "h") => self.open_in_new_tab(newtab::HISTORY_URL),
             Key::Named(NamedKey::Delete) if ctrl && shift => self.open_in_new_tab(newtab::HISTORY_URL),
             Key::Named(NamedKey::Tab) if ctrl => {

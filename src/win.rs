@@ -32,3 +32,12 @@ pub fn style_main_window(window: &Window) {
     set(h, DWMWA_WINDOW_CORNER_PREFERENCE as i32, DWMWCP_ROUND as i32);
     set(h, DWMWA_SYSTEMBACKDROP_TYPE as i32, DWMSBT_MAINWINDOW as i32);
 }
+
+/// Holt den Tastaturfokus ins Hauptfenster zurück (z. B. aus einem WebView2-Tab, wenn man in die
+/// Adressleiste tippen will).
+pub fn take_focus(window: &Window) {
+    if let Some(h) = hwnd(window) {
+        // SAFETY: gültiges Fenster-Handle des eigenen Threads.
+        unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(h) };
+    }
+}

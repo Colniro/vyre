@@ -57,3 +57,39 @@ fn physical_name(name: &str) -> &str {
         other => other,
     }
 }
+
+/// Ist das ein Tastenkürzel des Browsers? Muss zu `Browser::shortcut` in main.rs passen.
+/// WebView2-Tabs fangen damit die Kürzel ab, bevor die Seite sie bekommt.
+pub fn is_browser_shortcut(key: &winit::keyboard::Key, mods: ModifiersState) -> bool {
+    use winit::keyboard::Key as K;
+    let (ctrl, alt, shift) = (mods.control_key(), mods.alt_key(), mods.shift_key());
+    match key {
+        K::Character(c) if ctrl => {
+            let c = c.to_ascii_lowercase();
+            matches!(c.as_str(), "l" | "r" | "t" | "w" | "b" | "d" | "h" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+                || (shift && c == "e")
+        }
+        K::Named(WinitNamed::Tab) => ctrl,
+        K::Named(WinitNamed::Delete) => ctrl && shift,
+        K::Named(WinitNamed::ArrowLeft | WinitNamed::ArrowRight) => alt,
+        K::Named(WinitNamed::F2 | WinitNamed::F3 | WinitNamed::F5 | WinitNamed::F6) => true,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use winit::keyboard::{Key, SmolStr};
+
+    #[test]
+    fn browser_kuerzel() {
+        let ch = |c: &str| Key::Character(SmolStr::new(c));
+        assert!(is_browser_shortcut(&ch("t"), ModifiersState::CONTROL));
+        assert!(is_browser_shortcut(&ch("E"), ModifiersState::CONTROL | ModifiersState::SHIFT));
+        assert!(!is_browser_shortcut(&ch("e"), ModifiersState::CONTROL));
+        assert!(!is_browser_shortcut(&ch("c"), ModifiersState::CONTROL));
+        assert!(!is_browser_shortcut(&ch("t"), ModifiersState::empty()));
+        assert!(is_browser_shortcut(&Key::Named(WinitNamed::F5), ModifiersState::empty()));
+    }
+}

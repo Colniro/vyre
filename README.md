@@ -26,6 +26,7 @@ Der erste Build dauert lange, weil Servo mitgebaut wird. SpiderMonkey wird ferti
 | Strg+1 … 8, Strg+9 | Zu Tab 1 … 8, zum letzten Tab |
 | Strg+B | Seitenleiste: fest ↔ beim Hovern ausfahren |
 | Strg+D | Seite als Favorit anpinnen / lösen |
+| Strg+Umschalt+E | Engine des Tabs wechseln (Servo ↔ WebView2) |
 | Strg+H, Strg+Umschalt+Entf | Verlauf |
 | ↑ / ↓ in der Adressleiste | Vorschlag wählen |
 
@@ -74,6 +75,28 @@ DuckDuckGo, das tausende weitere kennt.
 Gespeichert in `%LOCALAPPDATA%\Vyre\verlauf.sqlite` und `sitzung.txt`. Nur `http`- und
 `https`-Seiten kommen in den Verlauf.
 
+## WebView2 als Ersatz-Engine
+
+Seiten, die Servo noch nicht schafft, laufen still mit WebView2 (der Chromium-Engine von
+Microsoft Edge, die in Windows 11 steckt), im selben Tab und Fenster. Man merkt davon nichts.
+
+- **Startliste**: YouTube, Discord, Google Docs/Drive/Mail/Meet/Kalender, Spotify, WhatsApp Web,
+  Telegram, Teams, Outlook, Office, Figma, Notion, Twitch, Canva öffnen sofort in WebView2.
+- **Erkennung**: 2,5 s nach dem Laden prüft Vyre Servo-Seiten. Meldet die Seite „Browser nicht
+  unterstützt“, bleibt sie nach JavaScript-Fehlern praktisch leer, oder stürzt sie ab, wechselt
+  der Tab zu WebView2. Gelernte Seiten gelten bis zum nächsten Vyre-Update, dann wird wieder
+  zuerst Servo versucht.
+- **Notausgang**: Strg+Umschalt+E wechselt die Engine des Tabs von Hand und merkt sich das
+  dauerhaft für die Seite.
+- **Logins**: Beim Wechsel nimmt Vyre die Cookies der Seite aus Servo mit.
+- **Abgeschottet**: eigenes Profil (`%LOCALAPPDATA%\Vyre\WebView2`), keine Crash-Berichte an
+  Microsoft, SmartScreen, Sync, Hintergrund-Verbindungen, Autofill und Passwort-Speicher aus.
+  Was WebView2 darüber hinaus selbst sendet, lässt sich von außen nicht garantiert abstellen.
+- **Werbeblocker** und Tastenkürzel funktionieren auch in WebView2-Tabs.
+- Die Laufzeit startet erst, wenn ein Tab sie braucht.
+
+Die gelernten und festgelegten Seiten stehen in `%LOCALAPPDATA%\Vyre\engine-seiten.txt`.
+
 ## Werbeblocker
 
 Eingebaut mit Braves [adblock-rust](https://github.com/brave/adblock-rust) und denselben
@@ -100,6 +123,8 @@ geladen. Das sind die einzigen Verbindungen, die Vyre von sich aus aufbaut.
 - `src/blocker.rs`: Werbeblocker (Filterlisten laden, Anfragen prüfen, Ausblend-Regeln)
 - `src/history.rs`: Verlauf und Favoriten (SQLite), Vorschläge
 - `src/session.rs`: offene Tabs speichern und wiederherstellen
+- `src/edge.rs`: WebView2-Tabs (Abschottung, Werbeblocker, Cookies, Kürzel)
+- `src/sites.rs`: welche Seite mit welcher Engine läuft
 - `src/settings.rs`: gespeicherte Einstellungen
 - `src/render/`: GPU-Zeichnen (aus Wyven übernommen)
 - `src/keys.rs`, `src/win.rs`: Tastenübersetzung, Windows-11-Fenstereffekte

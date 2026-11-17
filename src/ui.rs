@@ -104,6 +104,8 @@ pub enum Hit {
     Maximize,
     Close,
     UrlBar,
+    /// Werbeblocker für diese Seite ein/aus.
+    Shield,
     Tab(usize),
     TabClose(usize),
     NewTab,
@@ -139,6 +141,8 @@ pub struct Layout {
     pub sidebar_w: f32,
     pub top: [Rect; 7],
     pub url: Rect,
+    /// Werbeblocker-Schild rechts in der Adressleiste.
+    pub shield: Rect,
     pub tabs_label: Rect,
     pub tabs: Vec<Rect>,
     pub new_tab: Rect,
@@ -189,6 +193,7 @@ impl Layout {
             sidebar_w: sw,
             top: [nav(0.0), nav(1.0), nav(2.0), nav(3.0), ctl(0.0), ctl(1.0), ctl(2.0)],
             url,
+            shield: Rect { x: url.x + url.w - 50.0 * s, y: url.y + 4.0 * s, w: 46.0 * s, h: url.h - 8.0 * s },
             tabs_label,
             tabs,
             new_tab,
@@ -227,6 +232,9 @@ impl Layout {
                 if r.contains(x, y) {
                     return TOP[i];
                 }
+            }
+            if self.shield.contains(x, y) {
+                return Hit::Shield;
             }
             if self.url.contains(x, y) {
                 return Hit::UrlBar;
@@ -459,6 +467,7 @@ const ICON_CLOSE: &str = "\u{E8BB}";
 const ICON_LOCK: &str = "\u{E72E}";
 const ICON_GLOBE: &str = "\u{E774}";
 const ICON_ADD: &str = "\u{E710}";
+const ICON_SHIELD: &str = "\u{EA18}";
 
 /// Text und Symbol einer Tab-Zeile.
 struct TabLabels {
@@ -482,6 +491,8 @@ pub struct Ui {
     top_icons: Vec<Label>,
     url_icon: Label,
     url_label: Label,
+    shield_icon: Label,
+    shield_count: Label,
     tabs_label: Label,
     tab_labels: Vec<TabLabels>,
     new_tab_icon: Label,
@@ -506,6 +517,8 @@ pub struct Stats {
     pub refresh_hz: Option<f32>,
     pub bench: bool,
     pub maximized: bool,
+    /// Blockt der Werbeblocker auf der aktuellen Seite?
+    pub adblock_on: bool,
 }
 
 fn has_family(fs: &FontSystem, name: &str) -> bool {
@@ -544,6 +557,8 @@ impl Ui {
             top_icons: (0..TOP.len()).map(|_| Label::new(fs)).collect(),
             url_icon: Label::new(fs),
             url_label: Label::new(fs),
+            shield_icon: Label::new(fs),
+            shield_count: Label::new(fs),
             tabs_label: Label::new(fs),
             tab_labels: Vec::new(),
             new_tab_icon: Label::new(fs),
@@ -683,7 +698,24 @@ impl Ui {
         };
         self.url_label.set(fs, &url_text, 14.0 * s, &self.ui_family, false);
         let text_left = ur.x + 34.0 * s;
-        let text_w = ur.w - 34.0 * s - 10.0 * s;
+        // Das Schild des Werbeblockers: nur auf echten Seiten und nicht beim Tippen.
+        let show_shield = !self.url_focused && page.url.as_ref().is_some_and(|u| u.scheme().starts_with("http"));
+        let text_w = ur.w - 34.0 * s - if show_shield { layout.shield.w + 6.0 * s } else { 10.0 * s };
+        if show_shield {
+            let sr = layout.shield;
+            let a = self.anim(Hit::Shield);
+            if a > 0.0 {
+                cards.push(RoundRect::new(sr.x, sr.y, sr.w, sr.h, t.bg.with_alpha((a * 160.0) as u8), 6.0 * s));
+            }
+            self.shield_icon.set(fs, ICON_SHIELD, 11.0 * s, &self.icon_family, false);
+            let count = match (stats.adblock_on, page.blocked) {
+                (false, _) => "aus".to_string(),
+                (true, 0) => String::new(),
+                (true, n) if n > 999 => "999+".to_string(),
+                (true, n) => n.to_string(),
+            };
+            self.shield_count.set(fs, &count, 11.0 * s, &self.ui_family, true);
+        }
         if self.url_focused {
             let cx = self.url_label.x_at(self.url.cursor);
             if cx - self.url_scroll > text_w {
@@ -792,6 +824,27 @@ impl Ui {
             color: url_color,
             clip: Some([text_left.max(0.0) as i32, ur.y as i32, (text_left + text_w).max(0.0) as i32, (ur.y + ur.h) as i32]),
         });
+        if show_shield {
+            let sr = layout.shield;
+            let (icon_color, count_color) = if stats.adblock_on { (t.accent, t.text) } else { (t.dim.with_alpha(140), t.dim) };
+            let gap = 4.0 * s;
+            let total = self.shield_icon.width() + if self.shield_count.text.is_empty() { 0.0 } else { gap + self.shield_count.width() };
+            let x0 = (sr.x + (sr.w - total) / 2.0).round();
+            text.push(TextBlock {
+                buffer: &self.shield_icon.buffer,
+                x: x0,
+                y: (sr.y + (sr.h - self.shield_icon.line_height()) / 2.0).round(),
+                color: icon_color,
+                clip: Some(side_clip),
+            });
+            text.push(TextBlock {
+                buffer: &self.shield_count.buffer,
+                x: x0 + self.shield_icon.width() + gap,
+                y: (sr.y + (sr.h - self.shield_count.line_height()) / 2.0).round(),
+                color: count_color,
+                clip: Some(side_clip),
+            });
+        }
         let lr = layout.tabs_label;
         text.push(TextBlock { buffer: &self.tabs_label.buffer, x: lr.x, y: lr.y, color: t.dim, clip: Some(side_clip) });
         for (i, state) in tabs.tabs.iter().enumerate() {

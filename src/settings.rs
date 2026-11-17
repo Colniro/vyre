@@ -8,11 +8,13 @@ use crate::ui::SidebarMode;
 
 pub struct Settings {
     pub sidebar: SidebarMode,
+    /// Seiten, auf denen der Werbeblocker ausgeschaltet ist.
+    pub adblock_off: Vec<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { sidebar: SidebarMode::Pinned }
+        Self { sidebar: SidebarMode::Pinned, adblock_off: Vec::new() }
     }
 }
 
@@ -39,6 +41,13 @@ impl Settings {
                         s.sidebar = mode;
                     }
                 }
+                "werbeblocker_aus" => {
+                    s.adblock_off = value
+                        .split(',')
+                        .map(|h| h.trim().to_string())
+                        .filter(|h| !h.is_empty())
+                        .collect();
+                }
                 other => log::warn!("unbekannte Einstellung: {other}"),
             }
         }
@@ -46,7 +55,11 @@ impl Settings {
     }
 
     fn to_text(&self) -> String {
-        format!("# Vyre-Einstellungen\nseitenleiste = {}\n", self.sidebar.name())
+        format!(
+            "# Vyre-Einstellungen\nseitenleiste = {}\n# Seiten ohne Werbeblocker, mit Komma getrennt\nwerbeblocker_aus = {}\n",
+            self.sidebar.name(),
+            self.adblock_off.join(", ")
+        )
     }
 
     pub fn save(&self) {
@@ -66,8 +79,10 @@ mod tests {
 
     #[test]
     fn hin_und_zurueck() {
-        let s = Settings { sidebar: SidebarMode::Hover };
-        assert_eq!(Settings::parse(&s.to_text()).sidebar, SidebarMode::Hover);
+        let s = Settings { sidebar: SidebarMode::Hover, adblock_off: vec!["a.de".into(), "b.com".into()] };
+        let back = Settings::parse(&s.to_text());
+        assert_eq!(back.sidebar, SidebarMode::Hover);
+        assert_eq!(back.adblock_off, ["a.de", "b.com"]);
         assert_eq!(Settings::parse("").sidebar, SidebarMode::Pinned);
         assert_eq!(Settings::parse("seitenleiste = quatsch").sidebar, SidebarMode::Pinned);
     }

@@ -4,6 +4,7 @@
 //! Zen). Die Webseiten liegen in einem Kind-Fenster, in das Servo mit OpenGL zeichnet.
 //! Die Tastatur bleibt beim Hauptfenster und wird je nach Fokus an die Seite weitergereicht.
 
+mod blocker;
 mod engine;
 mod keys;
 mod render;
@@ -31,6 +32,8 @@ use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
 pub enum UserEvent {
     /// Servo hat Arbeit für den Hauptthread.
     ServoWake,
+    /// Die Filterlisten des Werbeblockers sind geladen.
+    BlockerReady,
 }
 
 const START_PAGE: &str = "https://servo.org/";
@@ -126,6 +129,7 @@ struct Browser {
     layout: Layout,
     sidebar: Sidebar,
     settings: Settings,
+    blocker: Arc<blocker::Blocker>,
     modifiers: ModifiersState,
     cursor: (f32, f32),
     ui_fps: FpsCounter,
@@ -152,8 +156,10 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
-        if let (Some(b), UserEvent::ServoWake) = (&mut self.browser, event) {
-            b.spin();
+        let Some(b) = &mut self.browser else { return };
+        match event {
+            UserEvent::ServoWake => b.spin(),
+            UserEvent::BlockerReady => b.window.request_redraw(),
         }
     }
 
@@ -194,6 +200,15 @@ fn to_bounds(r: ui::Rect) -> (i32, i32, u32, u32) {
 impl Browser {
     fn new(event_loop: &ActiveEventLoop, proxy: EventLoopProxy<UserEvent>, start: Url) -> Result<Self, String> {
         let settings = Settings::load();
+        // Filterlisten so früh wie möglich im Hintergrund laden.
+        let ready = proxy.clone();
+        let blocker = blocker::Blocker::start(
+            engine::profile_dir().parent().map(|p| p.join("Filter")).unwrap_or_default(),
+            settings.adblock_off.iter().cloned().collect(),
+            move || {
+                let _ = ready.send_event(UserEvent::BlockerReady);
+            },
+        );
         let attrs = Window::default_attributes()
             .with_title("Vyre")
             .with_decorations(false)
@@ -213,7 +228,7 @@ impl Browser {
         let layout = Layout::new(size.width, size.height, window.scale_factor() as f32, sidebar.mode, sidebar.reveal, 1);
 
         let t = Instant::now();
-        let engine = ServoEngine::new(event_loop, window.clone(), proxy, to_bounds(layout.content), start)?;
+        let engine = ServoEngine::new(event_loop, window.clone(), proxy, to_bounds(layout.content), start, blocker.clone())?;
         log::info!("Servo bereit nach {:?}", t.elapsed());
 
         let refresh_hz = window
@@ -229,6 +244,7 @@ impl Browser {
             layout,
             sidebar,
             settings,
+            blocker,
             modifiers: ModifiersState::empty(),
             cursor: (0.0, 0.0),
             ui_fps: FpsCounter::default(),
@@ -416,6 +432,16 @@ impl Browser {
         self.window.request_redraw();
     }
 
+    /// Schaltet den Werbeblocker für die Seite im aktiven Tab um und lädt sie neu.
+    fn toggle_adblock(&mut self) {
+        let Some(host) = self.engine.state().url.and_then(|u| blocker::host_of(u.as_str())) else { return };
+        let on = self.blocker.toggle(&host);
+        log::info!("Werbeblocker auf {host}: {}", if on { "an" } else { "aus" });
+        self.settings.adblock_off = self.blocker.allowed_hosts();
+        self.settings.save();
+        self.engine.reload();
+    }
+
     fn toggle_sidebar(&mut self) {
         self.sidebar.mode = self.sidebar.mode.toggled();
         self.settings.sidebar = self.sidebar.mode;
@@ -483,6 +509,7 @@ impl Browser {
             Hit::Close => event_loop.exit(),
             Hit::TabClose(i) => self.close_tab(event_loop, i),
             Hit::NewTab => self.new_tab(),
+            Hit::Shield => self.toggle_adblock(),
             _ => {}
         }
     }
@@ -603,6 +630,12 @@ impl Browser {
             refresh_hz: self.refresh_hz,
             bench: self.bench,
             maximized: self.window.is_maximized(),
+            adblock_on: self.blocker.is_ready()
+                && !page
+                    .url
+                    .as_ref()
+                    .and_then(|u| blocker::host_of(u.as_str()))
+                    .is_some_and(|h| self.blocker.is_allowed(&h)),
         };
         let view = TabsView { tabs: &tabs, active };
         let mut frame = self.ui.build(self.renderer.font_system(), &self.layout, &view, &stats);

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use euclid::Scale;
 use servo::{
     ConsoleLogLevel, CreateNewWebViewRequest, Cursor, DevicePoint, EventLoopWaker, InputEvent,
-    LoadStatus, MouseButton, MouseButtonAction, MouseButtonEvent, MouseLeftViewportEvent,
+    JSValue, LoadStatus, WebResourceLoad, WebResourceResponse, MouseButton, MouseButtonAction, MouseButtonEvent, MouseLeftViewportEvent,
     MouseMoveEvent, Opts, RenderingContext, Servo, ServoBuilder, WebView, WebViewBuilder,
     WebViewDelegate, WebViewId, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
     WindowRenderingContext,
@@ -27,7 +27,58 @@ use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::{CursorIcon, Window, WindowId};
 
 use crate::UserEvent;
+use crate::blocker::{self, Blocker};
 use crate::ui::FpsCounter;
+
+/// Fügt CSS als `<style>` in die Seite ein.
+fn inject_css(webview: &WebView, css: &str) {
+    if css.is_empty() {
+        return;
+    }
+    let script = format!(
+        "(function(){{var s=document.createElement('style');s.className='vyre-adblock';\
+         s.textContent={};(document.head||document.documentElement).appendChild(s);}})()",
+        js_string(css)
+    );
+    webview.evaluate_javascript(script, |_| {});
+}
+
+/// Sammelt alle Klassen und IDs der Seite für die allgemeinen Ausblend-Regeln.
+const COLLECT_CLASSES_IDS: &str = "(function(){var c=new Set(),i=new Set();\
+    document.querySelectorAll('[class],[id]').forEach(function(e){if(e.id)i.add(e.id);\
+    if(e.classList)e.classList.forEach(function(x){c.add(x)});});\
+    return [Array.from(c),Array.from(i)];})()";
+
+fn strings(v: &JSValue) -> Vec<String> {
+    match v {
+        JSValue::Array(items) => items
+            .iter()
+            .filter_map(|x| if let JSValue::String(s) = x { Some(s.clone()) } else { None })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Text als JavaScript-String-Literal.
+fn js_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '<' => out.push_str("\\u003c"),
+            c if (c as u32) < 0x20 || c == '\u{2028}' || c == '\u{2029}' => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
 
 /// Was die Oberfläche über eine geladene Seite wissen muss.
 #[derive(Clone, Debug, Default)]
@@ -37,6 +88,8 @@ pub struct PageState {
     pub loading: bool,
     pub can_back: bool,
     pub can_forward: bool,
+    /// Blockierte Anfragen (Werbung, Tracker) seit dem Laden der Seite.
+    pub blocked: usize,
 }
 
 /// Was Vyre von einer Web-Engine braucht, unabhängig davon, welche es ist.
@@ -103,10 +156,22 @@ struct Shared {
     child: Arc<Window>,
     main: Arc<Window>,
     context: Rc<WindowRenderingContext>,
+    blocker: Arc<Blocker>,
     /// Von Seiten geöffnete Tabs (target="_blank", window.open), noch nicht in der Liste.
     opened: RefCell<Vec<Tab>>,
     /// Von Seiten geschlossene Tabs (window.close).
     closed: RefCell<Vec<WebViewId>>,
+    /// CSS zum Ausblenden, das nach dem nächsten Servo-Durchlauf eingefügt wird.
+    pending_css: RefCell<Vec<(WebView, String)>>,
+}
+
+impl Shared {
+    fn queue_css(&self, webview: &WebView, css: String) {
+        if !css.is_empty() {
+            self.pending_css.borrow_mut().push((webview.clone(), css));
+            self.main.request_redraw(); // sorgt für einen weiteren Durchlauf
+        }
+    }
 }
 
 /// Nimmt Servos Meldungen für einen Tab entgegen.
@@ -151,6 +216,55 @@ impl WebViewDelegate for Delegate {
     fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
         self.state.borrow_mut().loading = status != LoadStatus::Complete;
         self.changed(&webview);
+        let Some(page) = webview.url().map(|u| u.to_string()) else { return };
+        let blocker = self.shared.blocker.clone();
+        match status {
+            // Seitenspezifische Regeln so früh wie möglich, damit nichts aufblitzt.
+            LoadStatus::HeadParsed => {
+                if let Some(c) = blocker.cosmetic(&page) {
+                    self.shared.queue_css(&webview, c.css);
+                }
+            }
+            // Allgemeine Regeln brauchen die Klassen und IDs der fertigen Seite.
+            LoadStatus::Complete => {
+                if !blocker.cosmetic(&page).is_some_and(|c| c.generic) {
+                    return;
+                }
+                let target = webview.clone();
+                let shared = self.shared.clone();
+                webview.evaluate_javascript(COLLECT_CLASSES_IDS, move |result| {
+                    let Ok(JSValue::Array(parts)) = result else { return };
+                    let (Some(classes), Some(ids)) = (parts.first(), parts.get(1)) else { return };
+                    let css = blocker.generic_css(&page, &strings(classes), &strings(ids));
+                    // Nicht direkt einfügen: Servo hält hier noch seinen JavaScript-Auswerter.
+                    shared.queue_css(&target, css);
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn load_web_resource(&self, webview: WebView, load: WebResourceLoad) {
+        let request = load.request();
+        if request.is_for_main_frame {
+            // Neue Seite im Tab: Zähler zurücksetzen. Die Seite selbst wird nicht blockiert.
+            self.state.borrow_mut().blocked = 0;
+            return;
+        }
+        let page = webview
+            .url()
+            .map(|u| u.to_string())
+            .or_else(|| request.referrer_url.as_ref().map(|u| u.to_string()))
+            .unwrap_or_default();
+        let kind = blocker::request_kind(&format!("{:?}", request.destination));
+        let url = request.url.clone().into_url();
+        if self.shared.blocker.should_block(url.as_str(), &page, kind) {
+            log::debug!("blockiert: {url}");
+            self.state.borrow_mut().blocked += 1;
+            self.shared.main.request_redraw();
+            load.intercept(WebResourceResponse::new(url)).cancel();
+        }
+        // Sonst: `load` fällt weg und Servo lädt die Anfrage normal.
     }
 
     fn notify_history_changed(&self, webview: WebView, _entries: Vec<Url>, _current: usize) {
@@ -220,6 +334,7 @@ impl ServoEngine {
         proxy: EventLoopProxy<UserEvent>,
         bounds: (i32, i32, u32, u32),
         url: Url,
+        blocker: Arc<Blocker>,
     ) -> Result<Self, String> {
         let (x, y, w, h) = bounds;
         let parent = main.window_handle().map_err(|e| e.to_string())?.as_raw();
@@ -259,8 +374,10 @@ impl ServoEngine {
             child,
             main,
             context,
+            blocker,
             opened: RefCell::default(),
             closed: RefCell::default(),
+            pending_css: RefCell::default(),
         });
         let mut engine = Self {
             tabs: Vec::new(),
@@ -313,6 +430,10 @@ impl ServoEngine {
 impl Engine for ServoEngine {
     fn spin(&mut self) -> bool {
         self.servo.spin_event_loop();
+        let css: Vec<(WebView, String)> = self.shared.pending_css.borrow_mut().drain(..).collect();
+        for (webview, css) in css {
+            inject_css(&webview, &css);
+        }
         let opened: Vec<Tab> = self.shared.opened.borrow_mut().drain(..).collect();
         let closed: Vec<WebViewId> = self.shared.closed.borrow_mut().drain(..).collect();
         let changed = !opened.is_empty() || !closed.is_empty();

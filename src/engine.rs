@@ -29,6 +29,7 @@ use winit::window::{CursorIcon, Window, WindowId};
 
 use crate::UserEvent;
 use crate::blocker::{self, Blocker};
+use crate::history::Store;
 use crate::ui::FpsCounter;
 
 /// Fügt CSS als `<style>` in die Seite ein.
@@ -158,6 +159,7 @@ struct Shared {
     main: Arc<Window>,
     context: Rc<WindowRenderingContext>,
     blocker: Arc<Blocker>,
+    history: Arc<Store>,
     /// Von Seiten geöffnete Tabs (target="_blank", window.open), noch nicht in der Liste.
     opened: RefCell<Vec<Tab>>,
     /// Von Seiten geschlossene Tabs (window.close).
@@ -205,11 +207,16 @@ impl WebViewDelegate for Delegate {
     }
 
     fn notify_url_changed(&self, webview: WebView, url: Url) {
+        // Der Titel kommt erst später (notify_page_title_changed), daher hier ohne Titel.
+        self.shared.history.record_visit(url.as_str(), None);
         self.state.borrow_mut().url = Some(url);
         self.changed(&webview);
     }
 
     fn notify_page_title_changed(&self, webview: WebView, title: Option<String>) {
+        if let (Some(url), Some(t)) = (webview.url(), title.as_deref()) {
+            self.shared.history.set_title(url.as_str(), t);
+        }
         self.state.borrow_mut().title = title;
         self.changed(&webview);
     }
@@ -337,6 +344,7 @@ impl ServoEngine {
         url: Url,
         blocker: Arc<Blocker>,
         protocols: ProtocolRegistry,
+        history: Arc<Store>,
     ) -> Result<Self, String> {
         let (x, y, w, h) = bounds;
         let parent = main.window_handle().map_err(|e| e.to_string())?.as_raw();
@@ -378,6 +386,7 @@ impl ServoEngine {
             main,
             context,
             blocker,
+            history,
             opened: RefCell::default(),
             closed: RefCell::default(),
             pending_css: RefCell::default(),

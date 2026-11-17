@@ -25,6 +25,9 @@ Der erste Build dauert lange, weil Servo mitgebaut wird. SpiderMonkey wird ferti
 | Strg+Tab / Strg+Umschalt+Tab | Nächster / vorheriger Tab |
 | Strg+1 … 8, Strg+9 | Zu Tab 1 … 8, zum letzten Tab |
 | Strg+B | Seitenleiste: fest ↔ beim Hovern ausfahren |
+| Strg+D | Seite als Favorit anpinnen / lösen |
+| Strg+H, Strg+Umschalt+Entf | Verlauf |
+| ↑ / ↓ in der Adressleiste | Vorschlag wählen |
 
 ## Seitenleiste
 
@@ -54,6 +57,23 @@ Ecosia, Google). Ändern geht jederzeit über „ändern“ unter dem Suchfeld.
 `!e`, `!b`). Ein Bang ohne Suchbegriff öffnet die Startseite. Unbekannte Bangs gehen an
 DuckDuckGo, das tausende weitere kennt.
 
+## Verlauf, Favoriten, Sitzung
+
+- **Vorschläge** beim Tippen in der Adressleiste: zuerst das, was Enter tut (Suche, !Bang
+  oder Adresse), dann passende Favoriten und Verlauf. Oft und kürzlich Besuchtes steht oben.
+  Pfeiltasten wählen, Enter oder Klick öffnet.
+- **Favoriten** (wie Zens „Essentials“): der Stern in der Adressleiste oder Strg+D pinnt die
+  Seite als farbiges Quadrat oben in die Seitenleiste. Ein Klick wechselt zum Tab mit dieser
+  Seite oder öffnet sie neu, ein Mittelklick löst den Favoriten.
+- **Verlauf** unter `vyre://verlauf` (Strg+H, Strg+Umschalt+Entf oder Link auf der
+  Neuer-Tab-Seite): durchsuchbar, Löschen pro Eintrag, für die letzte Stunde, heute, diese
+  Woche oder alles. Gelöschtes wird aus der Datei wirklich entfernt (`VACUUM`).
+- **Sitzung**: Die offenen Tabs werden bei jeder Änderung gespeichert und beim nächsten Start
+  wiederhergestellt (nicht, wenn Vyre mit einer Adresse gestartet wird).
+
+Gespeichert in `%LOCALAPPDATA%\Vyre\verlauf.sqlite` und `sitzung.txt`. Nur `http`- und
+`https`-Seiten kommen in den Verlauf.
+
 ## Werbeblocker
 
 Eingebaut mit Braves [adblock-rust](https://github.com/brave/adblock-rust) und denselben
@@ -78,6 +98,8 @@ geladen. Das sind die einzigen Verbindungen, die Vyre von sich aus aufbaut.
 - `src/newtab.rs`: das `vyre://`-Protokoll (Neuer-Tab-Seite, Suche, Aktionen)
 - `src/search.rs`: Suchmaschinen und lokale !Bangs
 - `src/blocker.rs`: Werbeblocker (Filterlisten laden, Anfragen prüfen, Ausblend-Regeln)
+- `src/history.rs`: Verlauf und Favoriten (SQLite), Vorschläge
+- `src/session.rs`: offene Tabs speichern und wiederherstellen
 - `src/settings.rs`: gespeicherte Einstellungen
 - `src/render/`: GPU-Zeichnen (aus Wyven übernommen)
 - `src/keys.rs`, `src/win.rs`: Tastenübersetzung, Windows-11-Fenstereffekte

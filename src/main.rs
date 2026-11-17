@@ -6,10 +6,12 @@
 
 mod blocker;
 mod engine;
+mod history;
 mod keys;
 mod newtab;
 mod render;
 mod search;
+mod session;
 mod settings;
 mod ui;
 #[cfg(windows)]
@@ -20,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use engine::{Engine, ServoEngine};
 use render::{RoundRect, Scene};
-use ui::{FpsCounter, Hit, Layout, SidebarMode, Stats, TabsView, THEME, Ui};
+use ui::{Counts, FpsCounter, Hit, Layout, SidebarMode, Stats, Suggestion, SuggestionKind, TabsView, THEME, Ui};
 use url::Url;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -127,6 +129,11 @@ struct Browser {
     sidebar: Sidebar,
     settings: settings::Shared,
     blocker: Arc<blocker::Blocker>,
+    history: Arc<history::Store>,
+    /// Angepinnte Favoriten (Kopie aus der Datenbank, bei Änderungen neu gelesen).
+    favorites: Vec<history::Favorite>,
+    /// Zuletzt gespeicherte Sitzung, damit nur bei Änderungen geschrieben wird.
+    saved_session: session::Session,
     modifiers: ModifiersState,
     cursor: (f32, f32),
     ui_fps: FpsCounter,
@@ -197,9 +204,23 @@ fn to_bounds(r: ui::Rect) -> (i32, i32, u32, u32) {
 impl Browser {
     fn new(event_loop: &ActiveEventLoop, proxy: EventLoopProxy<UserEvent>, start: Option<String>) -> Result<Self, String> {
         let settings = settings::Shared::load();
-        let start = start
-            .and_then(|a| search::resolve_input(&a, settings.get().search_engine.as_deref()))
-            .unwrap_or_else(|| Url::parse(newtab::NEW_TAB_URL).expect("gültige URL"));
+        let vyre_dir = engine::profile_dir().parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let history = Arc::new(history::Store::open(&vyre_dir.join("verlauf.sqlite")));
+        // Adresse von der Kommandozeile, sonst die Tabs vom letzten Mal, sonst ein neuer Tab.
+        let restore = match start {
+            Some(arg) => session::Session {
+                urls: search::resolve_input(&arg, settings.get().search_engine.as_deref())
+                    .map(|u| vec![u.to_string()])
+                    .unwrap_or_default(),
+                active: 0,
+            },
+            None => session::Session::load(&session::path()).unwrap_or_default(),
+        };
+        let mut urls: Vec<Url> = restore.urls.iter().filter_map(|u| Url::parse(u).ok()).collect();
+        if urls.is_empty() {
+            urls.push(Url::parse(newtab::NEW_TAB_URL).expect("gültige URL"));
+        }
+        let start = urls.remove(0);
         // Filterlisten so früh wie möglich im Hintergrund laden.
         let ready = proxy.clone();
         let blocker = blocker::Blocker::start(
@@ -225,16 +246,29 @@ impl Browser {
         let ui = Ui::new(renderer.font_system());
         let sidebar = Sidebar::new(settings.get().sidebar);
         let size = window.inner_size();
-        let layout = Layout::new(size.width, size.height, window.scale_factor() as f32, sidebar.mode, sidebar.reveal, 1);
+        let layout = Layout::new(size.width, size.height, window.scale_factor() as f32, sidebar.mode, sidebar.reveal, Counts { tabs: 1, ..Default::default() });
 
         // Eigene Seiten unter vyre:// (Neuer Tab, Suche).
         let mut protocols = servo::protocol_handler::ProtocolRegistry::with_internal_protocols();
-        if let Err(e) = protocols.register("vyre", newtab::VyreProtocol::new(settings.clone())) {
+        if let Err(e) = protocols.register("vyre", newtab::VyreProtocol::new(settings.clone(), history.clone())) {
             log::error!("vyre:// nicht registriert: {e:?}");
         }
         let t = Instant::now();
-        let engine = ServoEngine::new(event_loop, window.clone(), proxy, to_bounds(layout.content), start, blocker.clone(), protocols)?;
-        log::info!("Servo bereit nach {:?}", t.elapsed());
+        let mut engine = ServoEngine::new(
+            event_loop,
+            window.clone(),
+            proxy,
+            to_bounds(layout.content),
+            start,
+            blocker.clone(),
+            protocols,
+            history.clone(),
+        )?;
+        for url in urls {
+            engine.new_tab(url);
+        }
+        engine.select(restore.active);
+        log::info!("Servo bereit nach {:?} ({} Tabs)", t.elapsed(), engine.tabs().len());
 
         let refresh_hz = window
             .current_monitor()
@@ -250,6 +284,9 @@ impl Browser {
             sidebar,
             settings,
             blocker,
+            favorites: history.favorites(),
+            history,
+            saved_session: restore,
             modifiers: ModifiersState::empty(),
             cursor: (0.0, 0.0),
             ui_fps: FpsCounter::default(),
@@ -339,8 +376,17 @@ impl Browser {
                 (MouseButton::Left, ElementState::Released) => self.release(event_loop),
                 (MouseButton::Middle, ElementState::Released) => {
                     // Mittelklick auf einen Tab schließt ihn.
-                    if let Hit::Tab(i) | Hit::TabClose(i) = self.hit() {
-                        self.close_tab(event_loop, i);
+                    match self.hit() {
+                        Hit::Tab(i) | Hit::TabClose(i) => self.close_tab(event_loop, i),
+                        // Mittelklick auf einen Favoriten löst ihn.
+                        Hit::Favorite(i) => {
+                            if let Some(f) = self.favorites.get(i).cloned() {
+                                self.history.remove_favorite(&f.url);
+                                self.favorites = self.history.favorites();
+                                self.relayout();
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 _ => {}
@@ -373,7 +419,11 @@ impl Browser {
             self.window.scale_factor() as f32,
             self.sidebar.mode,
             self.sidebar.reveal,
-            self.engine.tabs().len(),
+            Counts {
+                tabs: self.engine.tabs().len(),
+                favorites: self.favorites.len(),
+                suggestions: if self.ui.url_focused { self.ui.suggestions.len() } else { 0 },
+            },
         );
         let (x, y, w, h) = to_bounds(self.layout.content);
         self.engine.set_bounds(x, y, w, h);
@@ -404,9 +454,125 @@ impl Browser {
     fn focus_page(&mut self) {
         if self.ui.url_focused {
             self.ui.url_focused = false;
-            self.window.request_redraw();
+            self.ui.suggestions.clear();
+            self.relayout();
         }
         self.engine.set_focused(true);
+    }
+
+    /// Berechnet die Vorschläge zur Eingabe neu: zuerst das, was Enter tut, dann Favoriten
+    /// und Verlauf.
+    fn update_suggestions(&mut self) {
+        let text = self.ui.url.text.trim().to_string();
+        let mut list: Vec<Suggestion> = Vec::new();
+        let engine_id = self.settings.get().search_engine.clone();
+        if let Some(url) = search::resolve_input(&text, engine_id.as_deref()) {
+            let is_search = search::search_url(&text, engine_id.as_deref()).as_ref() == Some(&url);
+            let engine = search::engine(engine_id.as_deref());
+            list.push(if is_search {
+                let bang = text.split_whitespace().any(|w| w.len() > 1 && w.starts_with('!'));
+                Suggestion {
+                    title: text.clone(),
+                    detail: if bang { format!("!Bang · {}", url.host_str().unwrap_or("")) } else { format!("Suche mit {}", engine.name) },
+                    url,
+                    kind: SuggestionKind::Search,
+                }
+            } else {
+                Suggestion { title: text.clone(), detail: "Seite öffnen".into(), url, kind: SuggestionKind::Open }
+            });
+        }
+        if !text.is_empty() {
+            let needle = text.to_lowercase();
+            for f in &self.favorites {
+                if list.len() >= 3 {
+                    break;
+                }
+                if f.title.to_lowercase().contains(&needle) || f.url.to_lowercase().contains(&needle) {
+                    if let Ok(url) = Url::parse(&f.url) {
+                        list.push(Suggestion { title: f.title.clone(), detail: short_url(&f.url), url, kind: SuggestionKind::Favorite });
+                    }
+                }
+            }
+            for e in self.history.suggest(&text, 8) {
+                if list.len() >= 6 {
+                    break;
+                }
+                if list.iter().any(|s| s.url.as_str() == e.url) {
+                    continue;
+                }
+                if let Ok(url) = Url::parse(&e.url) {
+                    let title = if e.title.trim().is_empty() { short_url(&e.url) } else { e.title.clone() };
+                    list.push(Suggestion { title, detail: short_url(&e.url), url, kind: SuggestionKind::History });
+                }
+            }
+        }
+        // Nur die eigene Eingabe ohne weitere Treffer: keine Liste nötig.
+        if list.len() == 1 && list[0].kind != SuggestionKind::Search {
+            list.clear();
+        }
+        if list != self.ui.suggestions {
+            self.ui.suggestions = list;
+            self.ui.selected = 0;
+            self.relayout();
+        }
+    }
+
+    /// Öffnet einen Vorschlag im aktiven Tab.
+    fn open_suggestion(&mut self, index: usize) {
+        if let Some(s) = self.ui.suggestions.get(index) {
+            self.engine.load(s.url.clone());
+        }
+        self.focus_page();
+    }
+
+    /// Pinnt die Seite im aktiven Tab an oder löst sie.
+    fn toggle_favorite(&mut self) {
+        let state = self.engine.state();
+        let Some(url) = state.url.filter(|u| history::is_recordable(u.as_str())) else { return };
+        let title = ui::tab_title(&self.engine.state());
+        let pinned = self.history.toggle_favorite(url.as_str(), &title);
+        log::info!("Favorit {}: {url}", if pinned { "angepinnt" } else { "gelöst" });
+        self.favorites = self.history.favorites();
+        self.relayout();
+    }
+
+    /// Favorit öffnen: zum Tab mit dieser Seite wechseln oder einen neuen öffnen (wie bei Zen).
+    fn open_favorite(&mut self, index: usize) {
+        let Some(f) = self.favorites.get(index).cloned() else { return };
+        let tabs = self.engine.tabs();
+        let open = tabs
+            .iter()
+            .position(|t| t.url.as_ref().is_some_and(|u| ui::same_site(u.as_str(), &f.url)));
+        match open {
+            Some(i) => self.select_tab(i),
+            None => {
+                if let Ok(url) = Url::parse(&f.url) {
+                    self.engine.new_tab(url);
+                    self.relayout();
+                    self.focus_page();
+                }
+            }
+        }
+    }
+
+    fn open_in_new_tab(&mut self, url: &str) {
+        if let Ok(url) = Url::parse(url) {
+            self.engine.new_tab(url);
+            self.relayout();
+            self.focus_page();
+        }
+    }
+
+    /// Speichert die offenen Tabs, wenn sie sich geändert haben.
+    fn save_session(&mut self, tabs: &[engine::PageState], active: usize) {
+        let now = session::Session {
+            urls: tabs.iter().filter_map(|t| t.url.as_ref().map(|u| u.to_string())).collect(),
+            active,
+        };
+        if now != self.saved_session && !now.urls.is_empty() {
+            now.save(&session::path());
+            self.saved_session = now;
+        }
     }
 
     fn new_tab(&mut self) {
@@ -515,6 +681,9 @@ impl Browser {
             Hit::TabClose(i) => self.close_tab(event_loop, i),
             Hit::NewTab => self.new_tab(),
             Hit::Shield => self.toggle_adblock(),
+            Hit::Star => self.toggle_favorite(),
+            Hit::Favorite(i) => self.open_favorite(i),
+            Hit::Suggestion(i) => self.open_suggestion(i),
             _ => {}
         }
     }
@@ -538,6 +707,9 @@ impl Browser {
                 self.close_tab(event_loop, i);
             }
             Key::Character(c) if ctrl && char_is(c, "b") => self.toggle_sidebar(),
+            Key::Character(c) if ctrl && char_is(c, "d") => self.toggle_favorite(),
+            Key::Character(c) if ctrl && char_is(c, "h") => self.open_in_new_tab(newtab::HISTORY_URL),
+            Key::Named(NamedKey::Delete) if ctrl && shift => self.open_in_new_tab(newtab::HISTORY_URL),
             Key::Named(NamedKey::Tab) if ctrl => {
                 let n = self.engine.tabs().len();
                 let a = self.engine.active();
@@ -580,11 +752,28 @@ impl Browser {
         let field = &mut self.ui.url;
         match &event.logical_key {
             Key::Named(NamedKey::Enter) => {
+                if self.ui.selected > 0 {
+                    let i = self.ui.selected;
+                    self.open_suggestion(i);
+                    return;
+                }
                 let engine = self.settings.get().search_engine.clone();
                 if let Some(url) = search::resolve_input(&field.text, engine.as_deref()) {
                     self.engine.load(url);
                 }
                 self.focus_page();
+                return;
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                if !self.ui.suggestions.is_empty() {
+                    self.ui.selected = (self.ui.selected + 1) % self.ui.suggestions.len();
+                }
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                let n = self.ui.suggestions.len();
+                if n > 0 {
+                    self.ui.selected = (self.ui.selected + n - 1) % n;
+                }
             }
             Key::Named(NamedKey::Escape) => self.focus_page(),
             Key::Named(NamedKey::Backspace) => field.backspace(),
@@ -616,6 +805,9 @@ impl Browser {
             }
             _ => {}
         }
+        if self.ui.url_focused {
+            self.update_suggestions();
+        }
         self.window.request_redraw();
     }
 
@@ -643,7 +835,9 @@ impl Browser {
                     .and_then(|u| blocker::host_of(u.as_str()))
                     .is_some_and(|h| self.blocker.is_allowed(&h)),
         };
-        let view = TabsView { tabs: &tabs, active };
+        self.save_session(&tabs, active);
+        let is_favorite = page.url.as_ref().is_some_and(|u| self.favorites.iter().any(|f| f.url == u.as_str()));
+        let view = TabsView { tabs: &tabs, active, favorites: &self.favorites, is_favorite };
         let mut frame = self.ui.build(self.renderer.font_system(), &self.layout, &view, &stats);
         // Weicher Schatten unter dem Seitenbereich.
         let c = self.layout.content;
@@ -656,9 +850,9 @@ impl Browser {
             text: &frame.text,
             over: &frame.over,
             masks: &[],
-            overlay_cards: &[],
-            overlay: &[],
-            overlay_text: &[],
+            overlay_cards: &frame.overlay_cards,
+            overlay: &frame.overlay,
+            overlay_text: &frame.overlay_text,
         };
         if self.renderer.draw(&scene) {
             self.ui_fps.tick();
@@ -677,4 +871,10 @@ fn resize_cursor(dir: ResizeDirection) -> CursorIcon {
         ResizeDirection::NorthEast | ResizeDirection::SouthWest => CursorIcon::NeswResize,
         ResizeDirection::NorthWest | ResizeDirection::SouthEast => CursorIcon::NwseResize,
     }
+}
+
+/// Adresse ohne "https://", "www." und abschließendes "/".
+fn short_url(url: &str) -> String {
+    let s = url.split("://").nth(1).unwrap_or(url);
+    s.trim_start_matches("www.").trim_end_matches('/').to_string()
 }

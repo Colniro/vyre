@@ -11,6 +11,7 @@ use std::collections::hash_map::RandomState;
 use std::future::Future;
 use std::hash::{BuildHasher, Hasher};
 use std::pin::Pin;
+use std::sync::Arc;
 
 use http::HeaderValue;
 use servo::protocol_handler::{
@@ -19,22 +20,25 @@ use servo::protocol_handler::{
 };
 use url::Url;
 
+use crate::history::{self, Store};
 use crate::search::{self, ENGINES};
 use crate::settings::{self, Tile};
 
 pub const NEW_TAB_URL: &str = "vyre://neuer-tab";
+pub const HISTORY_URL: &str = "vyre://verlauf";
 
 pub struct VyreProtocol {
     settings: settings::Shared,
+    history: Arc<Store>,
     token: String,
 }
 
 impl VyreProtocol {
-    pub fn new(settings: settings::Shared) -> Self {
+    pub fn new(settings: settings::Shared, history: Arc<Store>) -> Self {
         let a = RandomState::new().build_hasher().finish();
         let mut h = RandomState::new().build_hasher();
         h.write_u64(a ^ std::process::id() as u64);
-        Self { settings, token: format!("{a:016x}{:016x}", h.finish()) }
+        Self { settings, history, token: format!("{a:016x}{:016x}", h.finish()) }
     }
 
     /// Erzeugt das HTML für eine `vyre://`-Adresse.
@@ -42,6 +46,7 @@ impl VyreProtocol {
         let param = |name: &str| url.query_pairs().find(|(k, _)| k == name).map(|(_, v)| v.into_owned());
         match url.host_str().unwrap_or("") {
             "neuer-tab" => self.new_tab(),
+            "verlauf" => self.history_page(&param("q").unwrap_or_default()),
             "suche" => {
                 let q = param("q").unwrap_or_default();
                 let engine = self.settings.get().search_engine.clone();
@@ -55,15 +60,32 @@ impl VyreProtocol {
                     log::warn!("vyre://aktion ohne gültigen Schlüssel abgelehnt: {url}");
                     return message("Diese Aktion ist nur von der Neuer-Tab-Seite aus erlaubt.");
                 }
-                self.action(url.path(), &param);
-                redirect(NEW_TAB_URL)
+                redirect(self.action(url.path(), &param))
             }
             _ => message("Diese Vyre-Seite gibt es nicht."),
         }
     }
 
-    fn action(&self, path: &str, param: &dyn Fn(&str) -> Option<String>) {
+    /// Führt eine Aktion aus und liefert die Seite, zu der es danach zurückgeht.
+    fn action(&self, path: &str, param: &dyn Fn(&str) -> Option<String>) -> &'static str {
         match path {
+            "/verlauf-loeschen" => {
+                let seconds = match param("zeit").as_deref() {
+                    Some("stunde") => Some(3600),
+                    Some("tag") => Some(86400),
+                    Some("woche") => Some(7 * 86400),
+                    Some("alles") => None,
+                    _ => return HISTORY_URL,
+                };
+                self.history.delete_recent(seconds);
+                return HISTORY_URL;
+            }
+            "/verlauf-weg" => {
+                if let Some(url) = param("url") {
+                    self.history.delete_url(&url);
+                }
+                return HISTORY_URL;
+            }
             "/suchmaschine" => {
                 if let Some(id) = param("id").filter(|id| ENGINES.iter().any(|e| e.id == id)) {
                     self.settings.update(|s| s.search_engine = Some(id));
@@ -72,7 +94,7 @@ impl VyreProtocol {
             "/kachel-neu" => {
                 let raw = param("url").unwrap_or_default();
                 // Nur echte Adressen, keine Suchbegriffe.
-                let Some(url) = search::resolve_input(&raw, None).filter(|u| !is_search(u, &raw)) else { return };
+                let Some(url) = search::resolve_input(&raw, None).filter(|u| !is_search(u, &raw)) else { return NEW_TAB_URL };
                 let title = param("titel")
                     .map(|t| t.trim().to_string())
                     .filter(|t| !t.is_empty())
@@ -90,6 +112,77 @@ impl VyreProtocol {
             }
             other => log::warn!("unbekannte vyre-Aktion: {other}"),
         }
+        NEW_TAB_URL
+    }
+
+    fn history_page(&self, query: &str) -> String {
+        let entries = self.history.recent(query, 500);
+        let mut rows = String::new();
+        let mut group = "";
+        for e in &entries {
+            let age = history::now() - e.last;
+            let g = match age {
+                ..3600 => "Letzte Stunde",
+                ..86400 => "Heute",
+                ..604800 => "Diese Woche",
+                _ => "Älter",
+            };
+            if g != group {
+                group = g;
+                rows += &format!("<h3>{g}</h3>");
+            }
+            let title = if e.title.trim().is_empty() { e.url.as_str() } else { e.title.as_str() };
+            rows += &format!(
+                r#"<div class="entry"><a href="{url}"><span class="t">{title}</span><span class="u">{url_short}</span></a><span class="when">{when}</span><button class="del" title="Eintrag löschen" data-url="{url}"></button></div>"#,
+                url = esc(&e.url),
+                title = esc(title),
+                url_short = esc(e.url.split("://").nth(1).unwrap_or(&e.url).trim_end_matches('/')),
+                when = esc(&history::ago(e.last)),
+            );
+        }
+        if entries.is_empty() {
+            rows = format!(
+                "<p class=\"empty\">{}</p>",
+                if query.is_empty() { "Der Verlauf ist leer." } else { "Nichts gefunden." }
+            );
+        }
+        format!(
+            r##"<!doctype html>
+<html lang="de"><head><meta charset="utf-8"><title>Verlauf</title>
+<style>{CSS}{HISTORY_CSS}</style></head>
+<body><div class="page">
+  <h1>Verlauf</h1>
+  <form method="get" action="vyre://verlauf" autocomplete="off"><input name="q" value="{q}" placeholder="Verlauf durchsuchen"></form>
+  <div class="actions">
+    <span>Löschen:</span>
+    <button data-zeit="stunde">Letzte Stunde</button>
+    <button data-zeit="tag">Heute</button>
+    <button data-zeit="woche">Diese Woche</button>
+    <button data-zeit="alles" class="danger">Alles</button>
+  </div>
+  {rows}
+</div>
+<script>
+var T = {token_js};
+function go(path, params) {{
+  var q = Object.keys(params).map(function (k) {{ return k + "=" + encodeURIComponent(params[k]); }}).join("&");
+  location.replace("vyre://aktion/" + path + "?t=" + T + (q ? "&" + q : ""));
+}}
+document.querySelectorAll(".del").forEach(function (b) {{
+  b.addEventListener("click", function () {{ go("verlauf-weg", {{url: b.dataset.url}}); }});
+}});
+document.querySelectorAll(".actions button").forEach(function (b) {{
+  b.addEventListener("click", function () {{
+    // Zweimal klicken statt Rückfrage-Dialog.
+    if (b.dataset.armed) {{ go("verlauf-loeschen", {{zeit: b.dataset.zeit}}); return; }}
+    b.dataset.armed = "1"; b.textContent = "Wirklich löschen?"; b.classList.add("armed");
+  }});
+}});
+</script>
+</body></html>"##,
+            q = esc(query),
+            token_js = crate::engine::js_string(&self.token),
+        )
     }
 
     fn new_tab(&self) -> String {
@@ -102,7 +195,7 @@ impl VyreProtocol {
             let host = Url::parse(&t.url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
             let letter = t.title.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
             tiles += &format!(
-                r#"<div class="tile"><a href="{url}" title="{url}"><span class="icon" style="background:hsl({hue},42%,36%)">{letter}</span><span class="name">{title}</span></a><button class="x" title="Kachel entfernen" data-url="{url}">×</button></div>"#,
+                r#"<div class="tile"><a href="{url}" title="{url}"><span class="icon" style="background:hsl({hue},42%,36%)">{letter}</span><span class="name">{title}</span></a><button class="x" title="Kachel entfernen" data-url="{url}"></button></div>"#,
                 url = esc(&t.url),
                 hue = hue(&host),
                 letter = esc(&letter),
@@ -132,7 +225,7 @@ impl VyreProtocol {
   <form id="search" autocomplete="off">
     <input id="q" name="q" placeholder="Mit {engine} suchen oder !Bang eingeben (!yt, !w, !gh …)">
   </form>
-  <div class="engine-line">Suchmaschine: {engine} · <a href="#" id="change">ändern</a></div>
+  <div class="engine-line">Suchmaschine: {engine} · <a href="#" id="change">ändern</a> · <a href="vyre://verlauf">Verlauf</a></div>
   <div class="tiles">{tiles}
     <div class="tile add"><a href="#" id="add"><span class="icon plus">+</span><span class="name">Hinzufügen</span></a></div>
   </div>
@@ -292,6 +385,33 @@ h2 { margin: 0; font-size: 21px; font-weight: 600; }
 .engine span { color: #8a8a9c; font-size: 13px; }
 .engine:hover { border-color: #9d8cff; }
 .engine.chosen { border-color: #9d8cff; background: #343248; }
+/* Kreuz aus zwei gedrehten Strichen: sitzt unabhängig von der Schrift genau in der Mitte. */
+.x, .del { padding: 0; font-size: 0; }
+.x::before, .x::after, .del::before, .del::after { content: ""; position: absolute; left: 50%; top: 50%;
+  width: 10px; height: 1.5px; border-radius: 1px; background: currentColor; }
+.x::before, .del::before { transform: translate(-50%, -50%) rotate(45deg); }
+.x::after, .del::after { transform: translate(-50%, -50%) rotate(-45deg); }
+"#;
+
+const HISTORY_CSS: &str = r#"
+.page { max-width: 820px; margin: 0 auto; padding: 48px 24px; }
+h1 { font-size: 30px; font-weight: 600; margin: 0 0 20px; }
+h3 { margin: 28px 0 8px; font-size: 13px; font-weight: 600; color: #8a8a9c; text-transform: uppercase; letter-spacing: 0.5px; }
+.actions { display: flex; align-items: center; gap: 8px; margin: 14px 0 8px; color: #8a8a9c; font-size: 14px; flex-wrap: wrap; }
+.actions button { padding: 7px 13px; border-radius: 9px; border: 1.5px solid #2d2d3a; background: #21212b; color: #e8e8f0; font-size: 13px; cursor: pointer; }
+.actions button:hover { border-color: #9d8cff; }
+.actions button.danger:hover, .actions button.armed { border-color: #c42b1c; background: #3a1f1f; }
+.entry { display: flex; align-items: center; gap: 12px; padding: 6px 10px; border-radius: 10px; }
+.entry:hover { background: #21212b; }
+.entry a { flex: 1; min-width: 0; display: flex; flex-direction: column; color: #e8e8f0; }
+.entry .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 14px; }
+.entry .u { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12px; color: #8a8a9c; }
+.entry .when { font-size: 12px; color: #8a8a9c; white-space: nowrap; }
+.del { position: relative; flex-shrink: 0; padding: 0; width: 26px; height: 26px; border: none; border-radius: 13px; background: transparent; color: #8a8a9c; font-size: 16px; cursor: pointer; opacity: 0; }
+.entry:hover .del { opacity: 1; }
+.del:hover { background: #c42b1c; color: #fff; }
+.empty { color: #8a8a9c; margin-top: 30px; }
+
 "#;
 
 #[cfg(test)]
@@ -299,7 +419,7 @@ mod tests {
     use super::*;
 
     fn proto() -> VyreProtocol {
-        VyreProtocol { settings: settings::Shared::for_tests(), token: "geheim".into() }
+        VyreProtocol { settings: settings::Shared::for_tests(), history: Arc::new(Store::in_memory()), token: "geheim".into() }
     }
 
     #[test]
@@ -335,6 +455,18 @@ mod tests {
     fn suche_leitet_weiter() {
         let html = proto().page(&Url::parse("vyre://suche?q=%21yt%20katzen").unwrap());
         assert!(html.contains("youtube.com/results?search_query=katzen"));
+    }
+
+    #[test]
+    fn verlauf_seite_und_loeschen() {
+        let p = proto();
+        p.history.record_visit("https://de.wikipedia.org/", Some("Wikipedia <Start>"));
+        let html = p.page(&Url::parse("vyre://verlauf").unwrap());
+        assert!(html.contains("Wikipedia &lt;Start&gt;"));
+        assert!(html.contains("Letzte Stunde"));
+        let out = p.page(&Url::parse("vyre://aktion/verlauf-loeschen?t=geheim&zeit=alles").unwrap());
+        assert!(out.contains("vyre://verlauf"));
+        assert!(p.page(&Url::parse("vyre://verlauf").unwrap()).contains("Der Verlauf ist leer."));
     }
 
     #[test]

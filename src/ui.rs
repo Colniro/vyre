@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use winit::window::ResizeDirection;
 
 use crate::engine::PageState;
+use crate::history::Favorite;
 use crate::render::{Attrs, Buffer, Family, FontSystem, Metrics, Quad, RoundRect, Rgba, Shaping, TextBlock, Weight, Wrap};
 
 /// Farben der Oberfläche (dunkel, violetter Akzent).
@@ -106,6 +107,12 @@ pub enum Hit {
     UrlBar,
     /// Werbeblocker für diese Seite ein/aus.
     Shield,
+    /// Seite oben in der Seitenleiste anpinnen.
+    Star,
+    /// Angepinnter Favorit oben in der Seitenleiste.
+    Favorite(usize),
+    /// Vorschlag unter der Adressleiste.
+    Suggestion(usize),
     Tab(usize),
     TabClose(usize),
     NewTab,
@@ -143,6 +150,12 @@ pub struct Layout {
     pub url: Rect,
     /// Werbeblocker-Schild rechts in der Adressleiste.
     pub shield: Rect,
+    /// Stern zum Anpinnen, links neben dem Schild.
+    pub star: Rect,
+    /// Angepinnte Favoriten als kleine Quadrate unter der Adressleiste.
+    pub favorites: Vec<Rect>,
+    /// Vorschläge, schwebend unter der Adressleiste.
+    pub suggestions: Vec<Rect>,
     pub tabs_label: Rect,
     pub tabs: Vec<Rect>,
     pub new_tab: Rect,
@@ -150,8 +163,21 @@ pub struct Layout {
     pub fps: Rect,
 }
 
+/// Wie viele Einträge die Seitenleiste zeigt.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Counts {
+    pub tabs: usize,
+    pub favorites: usize,
+    pub suggestions: usize,
+}
+
+const FAVS_PER_ROW: usize = 6;
+const FAV_GAP: f32 = 6.0;
+const SUGGESTION_H: f32 = 46.0;
+
 impl Layout {
-    pub fn new(width: u32, height: u32, scale: f32, mode: SidebarMode, reveal: f32, tab_count: usize) -> Self {
+    pub fn new(width: u32, height: u32, scale: f32, mode: SidebarMode, reveal: f32, counts: Counts) -> Self {
+        let tab_count = counts.tabs;
         let s = scale;
         let (w, h) = (width as f32, height as f32);
         let sw = (SIDEBAR_W * s).round();
@@ -166,7 +192,30 @@ impl Layout {
         let ctl_w = 36.0 * s;
         let ctl = |i: f32| Rect { x: sx + sw - pad - (3.0 - i) * ctl_w + 4.0 * s, y: top, w: ctl_w, h: btn };
         let url = Rect { x: sx + pad, y: top + btn + 8.0 * s, w: sw - 2.0 * pad, h: 36.0 * s };
-        let tabs_label = Rect { x: sx + pad + 6.0 * s, y: url.y + url.h + 16.0 * s, w: sw - 2.0 * pad, h: 18.0 * s };
+        // Favoriten in Reihen unter der Adressleiste.
+        // Feste Anzahl pro Reihe; die Größe füllt die Breite der Leiste genau aus.
+        let per_row = FAVS_PER_ROW;
+        let fav_gap = FAV_GAP * s;
+        let fav = ((sw - 2.0 * pad - (per_row - 1) as f32 * fav_gap) / per_row as f32).floor();
+        let fav_top = url.y + url.h + 10.0 * s;
+        let favorites: Vec<Rect> = (0..counts.favorites)
+            .map(|i| Rect {
+                x: sx + pad + (i % per_row) as f32 * (fav + fav_gap),
+                y: fav_top + (i / per_row) as f32 * (fav + fav_gap),
+                w: fav,
+                h: fav,
+            })
+            .collect();
+        let above_tabs = favorites.last().map(|r| r.y + r.h).unwrap_or(url.y + url.h);
+        let tabs_label = Rect { x: sx + pad + 6.0 * s, y: above_tabs + 16.0 * s, w: sw - 2.0 * pad, h: 18.0 * s };
+        let suggestions = (0..counts.suggestions)
+            .map(|i| Rect {
+                x: url.x,
+                y: url.y + url.h + 6.0 * s + i as f32 * SUGGESTION_H * s,
+                w: url.w,
+                h: SUGGESTION_H * s,
+            })
+            .collect();
         let first = tabs_label.y + tabs_label.h + 4.0 * s;
         let row = |i: usize| Rect { x: sx + pad, y: first + i as f32 * (TAB_H + TAB_SPACING) * s, w: sw - 2.0 * pad, h: TAB_H * s };
         let tabs = (0..tab_count).map(row).collect();
@@ -194,6 +243,9 @@ impl Layout {
             top: [nav(0.0), nav(1.0), nav(2.0), nav(3.0), ctl(0.0), ctl(1.0), ctl(2.0)],
             url,
             shield: Rect { x: url.x + url.w - 50.0 * s, y: url.y + 4.0 * s, w: 46.0 * s, h: url.h - 8.0 * s },
+            star: Rect { x: url.x + url.w - 80.0 * s, y: url.y + 4.0 * s, w: 28.0 * s, h: url.h - 8.0 * s },
+            favorites,
+            suggestions,
             tabs_label,
             tabs,
             new_tab,
@@ -228,6 +280,12 @@ impl Layout {
             }
         }
         if self.over_sidebar(x) {
+            // Die Vorschläge schweben über allem anderen.
+            for (i, r) in self.suggestions.iter().enumerate() {
+                if r.contains(x, y) {
+                    return Hit::Suggestion(i);
+                }
+            }
             for (i, r) in self.top.iter().enumerate() {
                 if r.contains(x, y) {
                     return TOP[i];
@@ -235,6 +293,14 @@ impl Layout {
             }
             if self.shield.contains(x, y) {
                 return Hit::Shield;
+            }
+            if self.star.contains(x, y) {
+                return Hit::Star;
+            }
+            for (i, r) in self.favorites.iter().enumerate() {
+                if r.contains(x, y) {
+                    return Hit::Favorite(i);
+                }
             }
             if self.url.contains(x, y) {
                 return Hit::UrlBar;
@@ -468,6 +534,35 @@ const ICON_LOCK: &str = "\u{E72E}";
 const ICON_GLOBE: &str = "\u{E774}";
 const ICON_ADD: &str = "\u{E710}";
 const ICON_SHIELD: &str = "\u{EA18}";
+const ICON_STAR: &str = "\u{E734}";
+const ICON_STAR_FILLED: &str = "\u{E735}";
+const ICON_SEARCH: &str = "\u{E721}";
+const ICON_HISTORY: &str = "\u{E81C}";
+
+/// Ein Vorschlag unter der Adressleiste.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Suggestion {
+    pub title: String,
+    pub detail: String,
+    /// Wohin Enter oder ein Klick führt.
+    pub url: url::Url,
+    pub kind: SuggestionKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuggestionKind {
+    Search,
+    Open,
+    History,
+    Favorite,
+}
+
+/// Texte einer Vorschlagszeile.
+struct SuggestionLabels {
+    icon: Label,
+    title: Label,
+    detail: Label,
+}
 
 /// Text und Symbol einer Tab-Zeile.
 struct TabLabels {
@@ -493,6 +588,13 @@ pub struct Ui {
     url_label: Label,
     shield_icon: Label,
     shield_count: Label,
+    star_icon: Label,
+    fav_labels: Vec<Label>,
+    sug_labels: Vec<SuggestionLabels>,
+    /// Vorschläge zur aktuellen Eingabe; der erste ist das, was Enter ohne Auswahl tut.
+    pub suggestions: Vec<Suggestion>,
+    /// Ausgewählter Vorschlag (Pfeiltasten).
+    pub selected: usize,
     tabs_label: Label,
     tab_labels: Vec<TabLabels>,
     new_tab_icon: Label,
@@ -509,6 +611,10 @@ pub struct Frame<'a> {
     pub under: Vec<Quad>,
     pub text: Vec<TextBlock<'a>>,
     pub over: Vec<Quad>,
+    /// Schwebende Vorschläge über allem anderen.
+    pub overlay_cards: Vec<RoundRect>,
+    pub overlay: Vec<Quad>,
+    pub overlay_text: Vec<TextBlock<'a>>,
 }
 
 pub struct Stats {
@@ -531,6 +637,9 @@ fn has_family(fs: &FontSystem, name: &str) -> bool {
 pub struct TabsView<'a> {
     pub tabs: &'a [PageState],
     pub active: usize,
+    pub favorites: &'a [Favorite],
+    /// Ist die Seite im aktiven Tab angepinnt?
+    pub is_favorite: bool,
 }
 
 impl Ui {
@@ -559,6 +668,11 @@ impl Ui {
             url_label: Label::new(fs),
             shield_icon: Label::new(fs),
             shield_count: Label::new(fs),
+            star_icon: Label::new(fs),
+            fav_labels: Vec::new(),
+            sug_labels: Vec::new(),
+            suggestions: Vec::new(),
+            selected: 0,
             tabs_label: Label::new(fs),
             tab_labels: Vec::new(),
             new_tab_icon: Label::new(fs),
@@ -700,7 +814,16 @@ impl Ui {
         let text_left = ur.x + 34.0 * s;
         // Das Schild des Werbeblockers: nur auf echten Seiten und nicht beim Tippen.
         let show_shield = !self.url_focused && page.url.as_ref().is_some_and(|u| u.scheme().starts_with("http"));
-        let text_w = ur.w - 34.0 * s - if show_shield { layout.shield.w + 6.0 * s } else { 10.0 * s };
+        let text_w = ur.w - 34.0 * s - if show_shield { ur.x + ur.w - layout.star.x + 4.0 * s } else { 10.0 * s };
+        if show_shield {
+            let st = layout.star;
+            let a = self.anim(Hit::Star);
+            if a > 0.0 {
+                cards.push(RoundRect::new(st.x, st.y, st.w, st.h, t.bg.with_alpha((a * 160.0) as u8), 6.0 * s));
+            }
+            let icon = if tabs.is_favorite { ICON_STAR_FILLED } else { ICON_STAR };
+            self.star_icon.set(fs, icon, 11.0 * s, &self.icon_family, false);
+        }
         if show_shield {
             let sr = layout.shield;
             let a = self.anim(Hit::Shield);
@@ -741,6 +864,26 @@ impl Ui {
         if page.loading {
             let w = (ur.w - 18.0 * s) * self.load_anim.max(0.08);
             cards.push(RoundRect::new(ur.x + 9.0 * s, ur.y + ur.h - 3.0 * s, w, 2.0 * s, t.accent, 1.0 * s));
+        }
+
+        // Angepinnte Favoriten: farbiges Quadrat mit Anfangsbuchstaben.
+        while self.fav_labels.len() < tabs.favorites.len() {
+            self.fav_labels.push(Label::new(fs));
+        }
+        self.fav_labels.truncate(tabs.favorites.len());
+        let active_url = page.url.as_ref().map(|u| u.as_str().to_string()).unwrap_or_default();
+        for (i, f) in tabs.favorites.iter().enumerate() {
+            let r = layout.favorites[i];
+            let a = self.anim(Hit::Favorite(i));
+            let host = url::Url::parse(&f.url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
+            let base = hue_color(&host);
+            cards.push(RoundRect::new(r.x, r.y, r.w, r.h, lerp(base, Rgba::rgb(255, 255, 255), a * 0.12), 9.0 * s));
+            if same_site(&f.url, &active_url) {
+                cards.push(RoundRect::outline(r.x - 2.0 * s, r.y - 2.0 * s, r.w + 4.0 * s, r.h + 4.0 * s, t.accent, 11.0 * s, 1.5 * s));
+            }
+            let name = if f.title.trim().is_empty() { host.trim_start_matches("www.").to_string() } else { f.title.clone() };
+            let letter = name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
+            self.fav_labels[i].set(fs, &letter, 15.0 * s, &self.ui_family, true);
         }
 
         // Tab-Liste.
@@ -789,6 +932,39 @@ impl Ui {
             self.fps_label.set(fs, &line, 11.5 * s, &self.ui_family, false);
         }
 
+        // Vorschläge schweben über Favoriten und Tabs.
+        let mut overlay_cards = Vec::new();
+        let mut overlay_text = Vec::new();
+        if self.url_focused && !layout.suggestions.is_empty() {
+            let first = layout.suggestions[0];
+            let last = layout.suggestions[layout.suggestions.len() - 1];
+            let (x, y, w, h) = (first.x, first.y, first.w, last.y + last.h - first.y);
+            overlay_cards.push(RoundRect::shadow(x, y, w, h, Rgba(0, 0, 0, 120), 10.0 * s, 10.0 * s));
+            overlay_cards.push(RoundRect::new(x, y, w, h, t.surface, 10.0 * s));
+            while self.sug_labels.len() < self.suggestions.len() {
+                self.sug_labels.push(SuggestionLabels { icon: Label::new(fs), title: Label::new(fs), detail: Label::new(fs) });
+            }
+            for (i, sug) in self.suggestions.iter().enumerate().take(layout.suggestions.len()) {
+                let r = layout.suggestions[i];
+                let a = self.anim(Hit::Suggestion(i));
+                if i == self.selected {
+                    overlay_cards.push(RoundRect::new(r.x + 4.0 * s, r.y + 3.0 * s, r.w - 8.0 * s, r.h - 6.0 * s, t.active, 8.0 * s));
+                } else if a > 0.0 {
+                    overlay_cards.push(RoundRect::new(r.x + 4.0 * s, r.y + 3.0 * s, r.w - 8.0 * s, r.h - 6.0 * s, t.hover.with_alpha((a * 255.0) as u8), 8.0 * s));
+                }
+                let icon = match sug.kind {
+                    SuggestionKind::Search => ICON_SEARCH,
+                    SuggestionKind::Open => ICON_GLOBE,
+                    SuggestionKind::History => ICON_HISTORY,
+                    SuggestionKind::Favorite => ICON_STAR_FILLED,
+                };
+                let l = &mut self.sug_labels[i];
+                l.icon.set(fs, icon, 11.0 * s, &self.icon_family, false);
+                l.title.set(fs, &sug.title, 13.0 * s, &self.ui_family, false);
+                l.detail.set(fs, &sug.detail, 11.0 * s, &self.ui_family, false);
+            }
+        }
+
         // Text zusammenstellen.
         let mut text = Vec::new();
         let centered = |l: &'a Label, r: Rect, color: Rgba| TextBlock {
@@ -824,6 +1000,18 @@ impl Ui {
             color: url_color,
             clip: Some([text_left.max(0.0) as i32, ur.y as i32, (text_left + text_w).max(0.0) as i32, (ur.y + ur.h) as i32]),
         });
+        if show_shield {
+            text.push(TextBlock {
+                buffer: &self.star_icon.buffer,
+                x: (layout.star.x + (layout.star.w - self.star_icon.width()) / 2.0).round(),
+                y: (layout.star.y + (layout.star.h - self.star_icon.line_height()) / 2.0).round(),
+                color: if tabs.is_favorite { t.accent } else { t.dim },
+                clip: Some(side_clip),
+            });
+        }
+        for (i, l) in self.fav_labels.iter().enumerate() {
+            text.push(centered(l, layout.favorites[i], Rgba::rgb(255, 255, 255)));
+        }
         if show_shield {
             let sr = layout.shield;
             let (icon_color, count_color) = if stats.adblock_on { (t.accent, t.text) } else { (t.dim.with_alpha(140), t.dim) };
@@ -878,7 +1066,36 @@ impl Ui {
             let fr = layout.fps;
             text.push(TextBlock { buffer: &self.fps_label.buffer, x: fr.x, y: fr.y, color: t.dim, clip: Some(side_clip) });
         }
-        Frame { cards, under, text, over }
+        if self.url_focused && !layout.suggestions.is_empty() {
+            for (i, sug) in self.suggestions.iter().enumerate().take(layout.suggestions.len()) {
+                let r = layout.suggestions[i];
+                let l = &self.sug_labels[i];
+                let clip = Some([r.x.max(0.0) as i32, r.y as i32, (r.x + r.w - 10.0 * s).max(0.0) as i32, (r.y + r.h) as i32]);
+                overlay_text.push(TextBlock {
+                    buffer: &l.icon.buffer,
+                    x: (r.x + 12.0 * s).round(),
+                    y: (r.y + (r.h - l.icon.line_height()) / 2.0).round(),
+                    color: if sug.kind == SuggestionKind::Favorite { t.accent } else { t.dim },
+                    clip,
+                });
+                overlay_text.push(TextBlock {
+                    buffer: &l.title.buffer,
+                    x: (r.x + 34.0 * s).round(),
+                    y: (r.y + 6.0 * s).round(),
+                    color: t.text,
+                    clip,
+                });
+                overlay_text.push(TextBlock {
+                    buffer: &l.detail.buffer,
+                    x: (r.x + 34.0 * s).round(),
+                    y: (r.y + 6.0 * s + l.title.line_height()).round(),
+                    color: t.dim,
+                    clip,
+                });
+            }
+        }
+
+        Frame { cards, under, text, over, overlay_cards, overlay: Vec::new(), overlay_text }
     }
 }
 
@@ -890,6 +1107,33 @@ pub fn tab_title(state: &PageState) -> String {
         .filter(|t| !t.trim().is_empty())
         .or_else(|| state.url.as_ref().and_then(|u| u.host_str().map(str::to_string)))
         .unwrap_or_else(|| "Neuer Tab".into())
+}
+
+/// Farbe für einen Anfangsbuchstaben, fest pro Domain (wie auf der Neuer-Tab-Seite).
+fn hue_color(host: &str) -> Rgba {
+    let h = host.trim_start_matches("www.").bytes().fold(5381u32, |h, b| h.wrapping_mul(33) ^ b as u32) % 360;
+    // HSL(h, 42 %, 36 %) nach RGB.
+    let (s, l) = (0.42f32, 0.36f32);
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let hp = h as f32 / 60.0;
+    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
+    let (r, g, b) = match hp as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    let to = |v: f32| ((v + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    Rgba::rgb(to(r), to(g), to(b))
+}
+
+/// Gehören zwei Adressen zur selben Seite (Host ohne "www.")?
+pub fn same_site(a: &str, b: &str) -> bool {
+    let host = |u: &str| url::Url::parse(u).ok().and_then(|u| u.host_str().map(|h| h.trim_start_matches("www.").to_string()));
+    matches!((host(a), host(b)), (Some(x), Some(y)) if x == y)
 }
 
 fn lerp(a: Rgba, b: Rgba, t: f32) -> Rgba {
@@ -923,27 +1167,45 @@ mod tests {
     #[test]
     fn seitenleiste_faehrt_aus() {
         let tabs = 3;
-        let pinned = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 0.0, tabs);
+        let pinned = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 0.0, Counts { tabs, ..Default::default() });
         assert_eq!(pinned.sidebar_x, 0.0);
         assert_eq!(pinned.content.x, SIDEBAR_W);
         assert_eq!(pinned.hit(100.0, pinned.tabs[1].y + 5.0, false), Hit::Tab(1));
 
-        let hidden = Layout::new(1600, 900, 1.0, SidebarMode::Hover, 0.0, tabs);
+        let hidden = Layout::new(1600, 900, 1.0, SidebarMode::Hover, 0.0, Counts { tabs, ..Default::default() });
         assert_eq!(hidden.sidebar_x, -SIDEBAR_W);
         assert_eq!(hidden.content.x, GAP);
         assert_eq!(hidden.hit(7.0, 400.0, false), Hit::Edge);
         assert_eq!(hidden.hit(100.0, hidden.tabs[1].y + 5.0, false), Hit::Content);
 
         // Die Seite behält im Hover-Modus ihre Breite, sie wird nur verschoben.
-        let shown = Layout::new(1600, 900, 1.0, SidebarMode::Hover, 1.0, tabs);
+        let shown = Layout::new(1600, 900, 1.0, SidebarMode::Hover, 1.0, Counts { tabs, ..Default::default() });
         assert_eq!(shown.content.w, hidden.content.w);
         assert_eq!(shown.content.x, SIDEBAR_W);
         assert_eq!(shown.hit(100.0, shown.tabs[1].y + 5.0, false), Hit::Tab(1));
     }
 
     #[test]
+    fn favoriten_und_vorschlaege() {
+        let l = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 1.0, Counts { tabs: 2, favorites: 7, suggestions: 3 });
+        // 6 Favoriten pro Reihe, der siebte rutscht in die zweite Reihe.
+        assert_eq!(l.favorites[6].x, l.favorites[0].x);
+        assert!(l.favorites[6].y > l.favorites[0].y);
+        assert!(l.tabs_label.y > l.favorites[6].y + l.favorites[6].h);
+        // Ohne Vorschläge trifft man den Favoriten …
+        let plain = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 1.0, Counts { tabs: 2, favorites: 7, suggestions: 0 });
+        let f = plain.favorites[1];
+        assert_eq!(plain.hit(f.x + 3.0, f.y + 3.0, false), Hit::Favorite(1));
+        // … mit Vorschlägen liegen diese darüber und gewinnen.
+        assert_eq!(l.hit(f.x + 3.0, f.y + 3.0, false), Hit::Suggestion(0));
+        assert_eq!(l.hit(l.star.x + 3.0, l.star.y + 3.0, false), Hit::Star);
+        assert!(same_site("https://www.a.de/x", "https://a.de/"));
+        assert!(!same_site("https://a.de/", "vyre://neuer-tab"));
+    }
+
+    #[test]
     fn tab_schliessen_knopf() {
-        let l = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 1.0, 2);
+        let l = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 1.0, Counts { tabs: 2, ..Default::default() });
         let c = close_rect(l.tabs[0], 1.0);
         assert_eq!(l.hit(c.x + 2.0, c.y + 2.0, false), Hit::TabClose(0));
         assert_eq!(l.hit(l.new_tab.x + 5.0, l.new_tab.y + 5.0, false), Hit::NewTab);

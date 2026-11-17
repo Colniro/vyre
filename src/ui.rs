@@ -1,5 +1,9 @@
 //! Die Browser-Oberfläche: Seitenleiste (Navigation, Adressleiste, Tabs, Fensterknöpfe),
 //! Hover-Animationen und die FPS-Anzeige. Alles in physischen Pixeln, skaliert mit `scale`.
+//!
+//! Die Seitenleiste hat zwei Modi wie bei Zen: fest angeheftet, oder eingeklappt und beim
+//! Hovern am linken Rand ausfahrend. Beim Ausfahren wird die Seite nur verschoben, nicht in der
+//! Größe geändert. So muss Servo nichts neu umbrechen, und die Animation bleibt flüssig.
 
 use std::time::{Duration, Instant};
 
@@ -13,6 +17,7 @@ pub struct Theme {
     pub bg: Rgba,
     pub surface: Rgba,
     pub hover: Rgba,
+    pub active: Rgba,
     pub text: Rgba,
     pub dim: Rgba,
     pub accent: Rgba,
@@ -24,6 +29,7 @@ pub const THEME: Theme = Theme {
     bg: Rgba::rgb(0x15, 0x15, 0x1c),
     surface: Rgba::rgb(0x21, 0x21, 0x2b),
     hover: Rgba::rgb(0x2d, 0x2d, 0x3a),
+    active: Rgba::rgb(0x34, 0x32, 0x48),
     text: Rgba::rgb(0xe8, 0xe8, 0xf0),
     dim: Rgba::rgb(0x8a, 0x8a, 0x9c),
     accent: Rgba::rgb(0x9d, 0x8c, 0xff),
@@ -37,6 +43,41 @@ const SIDEBAR_W: f32 = 264.0;
 const GAP: f32 = 8.0;
 /// Breite des unsichtbaren Rands, an dem man die Fenstergröße ändert.
 const RESIZE_BAND: f32 = 6.0;
+const TAB_H: f32 = 36.0;
+const TAB_SPACING: f32 = 2.0;
+
+/// Wie sich die Seitenleiste verhält.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidebarMode {
+    /// Immer sichtbar, die Seite steht daneben.
+    Pinned,
+    /// Eingeklappt; fährt aus, wenn die Maus an den linken Rand kommt.
+    Hover,
+}
+
+impl SidebarMode {
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Pinned => Self::Hover,
+            Self::Hover => Self::Pinned,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Pinned => "fest",
+            Self::Hover => "hover",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s.trim() {
+            "fest" => Some(Self::Pinned),
+            "hover" => Some(Self::Hover),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rect {
@@ -58,27 +99,31 @@ pub enum Hit {
     Back,
     Forward,
     Reload,
+    SidebarToggle,
     Minimize,
     Maximize,
     Close,
     UrlBar,
-    Tab,
+    Tab(usize),
+    TabClose(usize),
+    NewTab,
+    /// Linker Rand im Hover-Modus: lässt die Seitenleiste ausfahren.
+    Edge,
     Drag,
     Resize(ResizeDirection),
     Content,
     Nothing,
 }
 
-/// Knöpfe mit Hover-Animation, in dieser Reihenfolge in `Ui::hover_anim`.
-const BUTTONS: [Hit; 8] = [
+/// Feste Knöpfe der oberen Zeile, in dieser Reihenfolge in `Layout::top`.
+const TOP: [Hit; 7] = [
     Hit::Back,
     Hit::Forward,
     Hit::Reload,
+    Hit::SidebarToggle,
     Hit::Minimize,
     Hit::Maximize,
     Hit::Close,
-    Hit::UrlBar,
-    Hit::Tab,
 ];
 
 /// Positionen aller Bereiche für die aktuelle Fenstergröße.
@@ -86,46 +131,75 @@ pub struct Layout {
     pub scale: f32,
     pub width: f32,
     pub height: f32,
-    pub buttons: [Rect; 8],
-    pub drag: Rect,
+    pub mode: SidebarMode,
+    /// Sichtbarer Teil der Seitenleiste (0 = eingeklappt, 1 = ganz da).
+    pub reveal: f32,
+    /// Linke Kante der Seitenleiste (negativ, solange sie eingeklappt ist).
+    pub sidebar_x: f32,
+    pub sidebar_w: f32,
+    pub top: [Rect; 7],
+    pub url: Rect,
+    pub tabs_label: Rect,
+    pub tabs: Vec<Rect>,
+    pub new_tab: Rect,
     pub content: Rect,
     pub fps: Rect,
-    pub tabs_label: Rect,
 }
 
 impl Layout {
-    pub fn new(width: u32, height: u32, scale: f32) -> Self {
+    pub fn new(width: u32, height: u32, scale: f32, mode: SidebarMode, reveal: f32, tab_count: usize) -> Self {
         let s = scale;
         let (w, h) = (width as f32, height as f32);
         let sw = (SIDEBAR_W * s).round();
+        let gap = (GAP * s).round();
+        let reveal = if mode == SidebarMode::Pinned { 1.0 } else { reveal.clamp(0.0, 1.0) };
+        let sx = ((reveal - 1.0) * sw).round();
+
         let btn = 30.0 * s;
         let top = 9.0 * s;
         let pad = 10.0 * s;
-        let nav = |i: f32| Rect { x: pad + i * (btn + 2.0 * s), y: top, w: btn, h: btn };
-        let ctl_w = 38.0 * s;
-        let ctl = |i: f32| Rect { x: sw - pad - (3.0 - i) * ctl_w + 4.0 * s, y: top, w: ctl_w, h: btn };
-        let url = Rect { x: pad, y: top + btn + 8.0 * s, w: sw - 2.0 * pad, h: 36.0 * s };
-        let tabs_label = Rect { x: pad + 6.0 * s, y: url.y + url.h + 16.0 * s, w: sw - 2.0 * pad, h: 18.0 * s };
-        let tab = Rect { x: pad, y: tabs_label.y + tabs_label.h + 4.0 * s, w: sw - 2.0 * pad, h: 36.0 * s };
-        let nav_end = nav(3.0).x;
-        let drag = Rect { x: nav_end, y: 0.0, w: (ctl(0.0).x - nav_end).max(0.0), h: top + btn };
-        let gap = (GAP * s).round();
-        let content = Rect { x: sw, y: gap, w: (w - sw - gap).max(1.0), h: (h - 2.0 * gap).max(1.0) };
-        let fps = Rect { x: pad + 4.0 * s, y: h - 46.0 * s, w: sw - 2.0 * pad, h: 40.0 * s };
+        let nav = |i: f32| Rect { x: sx + pad + i * (btn + 2.0 * s), y: top, w: btn, h: btn };
+        let ctl_w = 36.0 * s;
+        let ctl = |i: f32| Rect { x: sx + sw - pad - (3.0 - i) * ctl_w + 4.0 * s, y: top, w: ctl_w, h: btn };
+        let url = Rect { x: sx + pad, y: top + btn + 8.0 * s, w: sw - 2.0 * pad, h: 36.0 * s };
+        let tabs_label = Rect { x: sx + pad + 6.0 * s, y: url.y + url.h + 16.0 * s, w: sw - 2.0 * pad, h: 18.0 * s };
+        let first = tabs_label.y + tabs_label.h + 4.0 * s;
+        let row = |i: usize| Rect { x: sx + pad, y: first + i as f32 * (TAB_H + TAB_SPACING) * s, w: sw - 2.0 * pad, h: TAB_H * s };
+        let tabs = (0..tab_count).map(row).collect();
+        let new_tab = row(tab_count);
+
+        // Fest: Seite neben der Leiste. Hover: Seite fast fensterbreit, beim Ausfahren verschoben.
+        let content = match mode {
+            SidebarMode::Pinned => Rect { x: sw, y: gap, w: (w - sw - gap).max(1.0), h: (h - 2.0 * gap).max(1.0) },
+            SidebarMode::Hover => Rect {
+                x: (gap + reveal * (sw - gap)).round(),
+                y: gap,
+                w: (w - 2.0 * gap).max(1.0),
+                h: (h - 2.0 * gap).max(1.0),
+            },
+        };
+        let fps = Rect { x: sx + pad + 4.0 * s, y: h - 46.0 * s, w: sw - 2.0 * pad, h: 40.0 * s };
         Self {
             scale,
             width: w,
             height: h,
-            buttons: [nav(0.0), nav(1.0), nav(2.0), ctl(0.0), ctl(1.0), ctl(2.0), url, tab],
-            drag,
+            mode,
+            reveal,
+            sidebar_x: sx,
+            sidebar_w: sw,
+            top: [nav(0.0), nav(1.0), nav(2.0), nav(3.0), ctl(0.0), ctl(1.0), ctl(2.0)],
+            url,
+            tabs_label,
+            tabs,
+            new_tab,
             content,
             fps,
-            tabs_label,
         }
     }
 
-    pub fn rect(&self, hit: Hit) -> Rect {
-        BUTTONS.iter().position(|b| *b == hit).map(|i| self.buttons[i]).unwrap_or_default()
+    /// Liegt der Punkt über der (sichtbaren) Seitenleiste?
+    pub fn over_sidebar(&self, x: f32) -> bool {
+        self.reveal > 0.0 && x < self.sidebar_x + self.sidebar_w
     }
 
     pub fn hit(&self, x: f32, y: f32, maximized: bool) -> Hit {
@@ -148,20 +222,42 @@ impl Layout {
                 return Hit::Resize(dir);
             }
         }
-        for (i, r) in self.buttons.iter().enumerate() {
-            if r.contains(x, y) {
-                return BUTTONS[i];
+        if self.over_sidebar(x) {
+            for (i, r) in self.top.iter().enumerate() {
+                if r.contains(x, y) {
+                    return TOP[i];
+                }
+            }
+            if self.url.contains(x, y) {
+                return Hit::UrlBar;
+            }
+            for (i, r) in self.tabs.iter().enumerate() {
+                if r.contains(x, y) {
+                    if close_rect(*r, self.scale).contains(x, y) {
+                        return Hit::TabClose(i);
+                    }
+                    return Hit::Tab(i);
+                }
+            }
+            if self.new_tab.contains(x, y) {
+                return Hit::NewTab;
             }
         }
         if self.content.contains(x, y) {
             return Hit::Content;
         }
-        if self.drag.contains(x, y) || x < self.content.x || y < self.content.y {
-            // Freie Flächen der Seitenleiste und der Rand verschieben das Fenster.
-            return Hit::Drag;
+        if self.mode == SidebarMode::Hover && x < self.content.x && !self.over_sidebar(x) {
+            return Hit::Edge;
         }
-        Hit::Nothing
+        // Freie Flächen der Seitenleiste und der Rand verschieben das Fenster.
+        Hit::Drag
     }
+}
+
+/// Schließen-Knopf rechts in einer Tab-Zeile.
+fn close_rect(tab: Rect, s: f32) -> Rect {
+    let size = 24.0 * s;
+    Rect { x: tab.x + tab.w - size - 6.0 * s, y: tab.y + (tab.h - size) / 2.0, w: size, h: size }
 }
 
 /// Einzeiliges Eingabefeld (Adressleiste).
@@ -297,8 +393,8 @@ struct Label {
 }
 
 impl Label {
-    fn new(fs: &mut FontSystem, size: f32) -> Self {
-        let mut buffer = Buffer::new(fs, Metrics::new(size, size * 1.3));
+    fn new(fs: &mut FontSystem) -> Self {
+        let mut buffer = Buffer::new(fs, Metrics::new(14.0, 18.0));
         buffer.set_wrap(Wrap::None);
         Self { buffer, text: "\u{0}".into(), key: (0, false) }
     }
@@ -354,28 +450,42 @@ const ICON_BACK: &str = "\u{E72B}";
 const ICON_FORWARD: &str = "\u{E72A}";
 const ICON_RELOAD: &str = "\u{E72C}";
 const ICON_STOP: &str = "\u{E711}";
+const ICON_PANE_OPEN: &str = "\u{E8A0}";
+const ICON_PANE_CLOSE: &str = "\u{E89F}";
 const ICON_MIN: &str = "\u{E921}";
 const ICON_MAX: &str = "\u{E922}";
 const ICON_RESTORE: &str = "\u{E923}";
 const ICON_CLOSE: &str = "\u{E8BB}";
 const ICON_LOCK: &str = "\u{E72E}";
 const ICON_GLOBE: &str = "\u{E774}";
+const ICON_ADD: &str = "\u{E710}";
+
+/// Text und Symbol einer Tab-Zeile.
+struct TabLabels {
+    icon: Label,
+    title: Label,
+    close: Label,
+}
 
 pub struct Ui {
     pub url: TextField,
     pub url_focused: bool,
     pub hover: Hit,
     pub pressed: Option<Hit>,
-    hover_anim: [f32; 8],
+    /// Hover-Animation je Knopf (0..1); Einträge bei 0 werden entfernt.
+    anims: Vec<(Hit, f32)>,
     last_anim: Instant,
     /// Lade-Fortschritt 0..1 für den Balken (nur Anzeige).
     load_anim: f32,
     ui_family: String,
     icon_family: String,
-    icons: Vec<Label>,
+    top_icons: Vec<Label>,
+    url_icon: Label,
     url_label: Label,
     tabs_label: Label,
-    tab_label: Label,
+    tab_labels: Vec<TabLabels>,
+    new_tab_icon: Label,
+    new_tab_label: Label,
     fps_label: Label,
     /// Horizontales Verschieben des URL-Textes, damit der Cursor sichtbar bleibt.
     url_scroll: f32,
@@ -404,6 +514,12 @@ fn has_family(fs: &FontSystem, name: &str) -> bool {
         .any(|f| f.families.iter().any(|(fam, _)| fam.eq_ignore_ascii_case(name)))
 }
 
+/// Was die Oberfläche über die Tabs wissen muss.
+pub struct TabsView<'a> {
+    pub tabs: &'a [PageState],
+    pub active: usize,
+}
+
 impl Ui {
     pub fn new(fs: &mut FontSystem) -> Self {
         let ui_family = ["Segoe UI Variable Text", "Segoe UI", "Noto Sans", "DejaVu Sans"]
@@ -422,19 +538,32 @@ impl Ui {
             url_focused: false,
             hover: Hit::Nothing,
             pressed: None,
-            hover_anim: [0.0; 8],
+            anims: Vec::new(),
             last_anim: Instant::now(),
             load_anim: 0.0,
-            icons: (0..8).map(|_| Label::new(fs, 12.0)).collect(),
-            url_label: Label::new(fs, 14.0),
-            tabs_label: Label::new(fs, 12.0),
-            tab_label: Label::new(fs, 14.0),
-            fps_label: Label::new(fs, 12.0),
+            top_icons: (0..TOP.len()).map(|_| Label::new(fs)).collect(),
+            url_icon: Label::new(fs),
+            url_label: Label::new(fs),
+            tabs_label: Label::new(fs),
+            tab_labels: Vec::new(),
+            new_tab_icon: Label::new(fs),
+            new_tab_label: Label::new(fs),
+            fps_label: Label::new(fs),
             ui_family,
             icon_family,
             url_scroll: 0.0,
             show_fps: true,
         }
+    }
+
+    /// Hover-Wert (0..1) eines Knopfes.
+    pub fn anim(&self, hit: Hit) -> f32 {
+        self.anims.iter().find(|(h, _)| *h == hit).map(|(_, v)| *v).unwrap_or(0.0)
+    }
+
+    /// Der Knopf, über dem die Maus ist; über dem Schließen-Kreuz zählt auch die Tab-Zeile.
+    fn hovered(&self, hit: Hit) -> bool {
+        self.hover == hit || matches!((self.hover, hit), (Hit::TabClose(a), Hit::Tab(b)) if a == b)
     }
 
     /// Schreitet die Animationen voran. `true`, solange noch etwas animiert.
@@ -444,10 +573,20 @@ impl Ui {
         self.last_anim = now;
         // Dezent: etwa 90 ms bis zum Ziel, exponentiell geglättet.
         let k = 1.0 - (-dt / 0.035).exp();
+        let mut targets = vec![self.hover];
+        if let Hit::TabClose(i) = self.hover {
+            targets.push(Hit::Tab(i));
+        }
+        for t in &targets {
+            if !matches!(t, Hit::Nothing | Hit::Drag | Hit::Content | Hit::Edge | Hit::Resize(_))
+                && !self.anims.iter().any(|(h, _)| h == t)
+            {
+                self.anims.push((*t, 0.0));
+            }
+        }
         let mut moving = false;
-        for (i, b) in BUTTONS.iter().enumerate() {
-            let target = if self.hover == *b { 1.0 } else { 0.0 };
-            let v = &mut self.hover_anim[i];
+        for (h, v) in &mut self.anims {
+            let target = if targets.contains(h) { 1.0 } else { 0.0 };
             *v += (target - *v) * k;
             if (target - *v).abs() < 0.01 {
                 *v = target;
@@ -455,6 +594,7 @@ impl Ui {
                 moving = true;
             }
         }
+        self.anims.retain(|(h, v)| *v > 0.0 || targets.contains(h));
         if page.loading {
             // Läuft langsam auf 90 % zu, bis die Seite fertig ist.
             self.load_anim += (0.9 - self.load_anim) * (1.0 - (-dt / 1.2).exp());
@@ -463,10 +603,6 @@ impl Ui {
             self.load_anim = 0.0;
         }
         moving
-    }
-
-    pub fn hover_index(&self, hit: Hit) -> f32 {
-        BUTTONS.iter().position(|b| *b == hit).map(|i| self.hover_anim[i]).unwrap_or(0.0)
     }
 
     /// Text, den die Adressleiste ohne Fokus zeigt.
@@ -480,7 +616,7 @@ impl Ui {
 
     /// Setzt den Cursor in der Adressleiste an die Klickposition.
     pub fn click_url(&mut self, x: f32, layout: &Layout, select: bool) {
-        let r = layout.rect(Hit::UrlBar);
+        let r = layout.url;
         let text_x = r.x + 34.0 * layout.scale - self.url_scroll;
         let idx = self.url_label.index_at(x - text_x);
         self.url.move_to(idx, select);
@@ -490,51 +626,55 @@ impl Ui {
         &'a mut self,
         fs: &mut FontSystem,
         layout: &Layout,
-        page: &PageState,
+        tabs: &TabsView<'_>,
         stats: &Stats,
     ) -> Frame<'a> {
         let s = layout.scale;
         let t = &THEME;
+        let page = tabs.tabs.get(tabs.active).cloned().unwrap_or_default();
         let mut cards = Vec::new();
         let mut under = Vec::new();
         let mut over = Vec::new();
+        // Alles in der Seitenleiste wird auf ihren sichtbaren Teil beschnitten.
+        let side_clip = [0, 0, (layout.sidebar_x + layout.sidebar_w).max(0.0) as i32, layout.height as i32];
 
-        // Knöpfe: Hintergrund beim Hovern weich einblenden.
+        // Obere Zeile: Hintergrund beim Hovern weich einblenden.
         let icons = [
             ICON_BACK,
             ICON_FORWARD,
             if page.loading { ICON_STOP } else { ICON_RELOAD },
+            if layout.mode == SidebarMode::Pinned { ICON_PANE_CLOSE } else { ICON_PANE_OPEN },
             ICON_MIN,
             if stats.maximized { ICON_RESTORE } else { ICON_MAX },
             ICON_CLOSE,
         ];
         for (i, icon) in icons.iter().enumerate() {
-            let r = layout.buttons[i];
-            let a = self.hover_anim[i];
-            let pressed = self.pressed == Some(BUTTONS[i]) && self.hover == BUTTONS[i];
+            let r = layout.top[i];
+            let a = self.anim(TOP[i]);
+            let pressed = self.pressed == Some(TOP[i]) && self.hover == TOP[i];
             if a > 0.0 {
-                let base = if BUTTONS[i] == Hit::Close { t.close } else { t.hover };
+                let base = if TOP[i] == Hit::Close { t.close } else { t.hover };
                 let alpha = (a * if pressed { 200.0 } else { 255.0 }) as u8;
                 cards.push(RoundRect::new(r.x, r.y, r.w, r.h, base.with_alpha(alpha), 7.0 * s));
             }
-            self.icons[i].set(fs, icon, 11.0 * s, &self.icon_family, false);
+            self.top_icons[i].set(fs, icon, 11.0 * s, &self.icon_family, false);
         }
 
         // Adressleiste.
-        let ur = layout.rect(Hit::UrlBar);
-        let ua = self.hover_index(Hit::UrlBar);
+        let ur = layout.url;
+        let ua = self.anim(Hit::UrlBar);
         let url_bg = if self.url_focused { t.hover } else { lerp(t.surface, t.hover, ua * 0.6) };
         cards.push(RoundRect::new(ur.x, ur.y, ur.w, ur.h, url_bg, 9.0 * s));
         if self.url_focused {
             cards.push(RoundRect::outline(ur.x, ur.y, ur.w, ur.h, t.accent.with_alpha(170), 9.0 * s, 1.5 * s));
         }
         let secure = page.url.as_ref().is_some_and(|u| u.scheme() == "https");
-        self.icons[6].set(fs, if secure { ICON_LOCK } else { ICON_GLOBE }, 11.0 * s, &self.icon_family, false);
+        self.url_icon.set(fs, if secure { ICON_LOCK } else { ICON_GLOBE }, 11.0 * s, &self.icon_family, false);
 
         let (url_text, url_color) = if self.url_focused {
             (self.url.text.clone(), t.text)
         } else {
-            let shown = Self::display_url(page);
+            let shown = Self::display_url(&page);
             if shown.is_empty() {
                 ("Suchen oder Adresse eingeben".to_string(), t.dim)
             } else {
@@ -557,10 +697,8 @@ impl Ui {
         let url_y = ur.y + (ur.h - self.url_label.line_height()) / 2.0;
         if self.url_focused {
             if let Some((a, b)) = self.url.selection() {
-                let x0 = text_left + self.url_label.x_at(a) - self.url_scroll;
-                let x1 = text_left + self.url_label.x_at(b) - self.url_scroll;
-                let x0 = x0.max(text_left);
-                let x1 = x1.min(text_left + text_w);
+                let x0 = (text_left + self.url_label.x_at(a) - self.url_scroll).max(text_left);
+                let x1 = (text_left + self.url_label.x_at(b) - self.url_scroll).min(text_left + text_w);
                 under.push(Quad { x: x0, y: url_y, w: (x1 - x0).max(0.0), h: self.url_label.line_height(), color: t.selection });
             } else {
                 let cx = text_left + self.url_label.x_at(self.url.cursor) - self.url_scroll;
@@ -573,26 +711,47 @@ impl Ui {
             cards.push(RoundRect::new(ur.x + 9.0 * s, ur.y + ur.h - 3.0 * s, w, 2.0 * s, t.accent, 1.0 * s));
         }
 
-        // Tabs.
+        // Tab-Liste.
         self.tabs_label.set(fs, "TABS", 11.0 * s, &self.ui_family, true);
-        let tr = layout.rect(Hit::Tab);
-        let ta = self.hover_index(Hit::Tab);
-        cards.push(RoundRect::new(tr.x, tr.y, tr.w, tr.h, lerp(t.surface, t.hover, ta * 0.5), 9.0 * s));
-        let title = page
-            .title
-            .clone()
-            .filter(|t| !t.trim().is_empty())
-            .or_else(|| page.url.as_ref().and_then(|u| u.host_str().map(str::to_string)))
-            .unwrap_or_else(|| "Neuer Tab".into());
-        self.tab_label.set(fs, &ellipsize(&title, 30), 13.5 * s, &self.ui_family, false);
-        self.icons[7].set(fs, ICON_GLOBE, 11.0 * s, &self.icon_family, false);
+        while self.tab_labels.len() < tabs.tabs.len() {
+            self.tab_labels.push(TabLabels { icon: Label::new(fs), title: Label::new(fs), close: Label::new(fs) });
+        }
+        self.tab_labels.truncate(tabs.tabs.len().max(1));
+        for (i, state) in tabs.tabs.iter().enumerate() {
+            let r = layout.tabs[i];
+            let a = self.anim(Hit::Tab(i));
+            let bg = if i == tabs.active { t.active } else { lerp(t.bg, t.hover, a * 0.8) };
+            if i == tabs.active || a > 0.0 {
+                cards.push(RoundRect::new(r.x, r.y, r.w, r.h, bg, 9.0 * s));
+            }
+            if self.hovered(Hit::Tab(i)) || i == tabs.active {
+                let c = close_rect(r, s);
+                let ca = self.anim(Hit::TabClose(i));
+                if ca > 0.0 {
+                    cards.push(RoundRect::new(c.x, c.y, c.w, c.h, t.hover.with_alpha((ca * 255.0) as u8), 6.0 * s));
+                }
+            }
+            let labels = &mut self.tab_labels[i];
+            labels.icon.set(fs, ICON_GLOBE, 11.0 * s, &self.icon_family, false);
+            labels.title.set(fs, &tab_title(state), 13.5 * s, &self.ui_family, i == tabs.active);
+            labels.close.set(fs, ICON_CLOSE, 8.5 * s, &self.icon_family, false);
+            if state.loading {
+                // Kleiner Punkt statt Symbol, solange der Tab lädt.
+                let d = 6.0 * s;
+                cards.push(RoundRect::new(r.x + 15.0 * s, r.y + (r.h - d) / 2.0, d, d, t.accent, d / 2.0));
+            }
+        }
+        let na = self.anim(Hit::NewTab);
+        let nr = layout.new_tab;
+        if na > 0.0 {
+            cards.push(RoundRect::new(nr.x, nr.y, nr.w, nr.h, t.hover.with_alpha((na * 200.0) as u8), 9.0 * s));
+        }
+        self.new_tab_icon.set(fs, ICON_ADD, 11.0 * s, &self.icon_family, false);
+        self.new_tab_label.set(fs, "Neuer Tab", 13.5 * s, &self.ui_family, false);
 
         // FPS-Anzeige.
         if self.show_fps {
-            let hz = stats
-                .refresh_hz
-                .map(|h| format!("{h:.0} Hz"))
-                .unwrap_or_else(|| "? Hz".into());
+            let hz = stats.refresh_hz.map(|h| format!("{h:.0} Hz")).unwrap_or_else(|| "? Hz".into());
             let mode = if stats.bench { "  ·  Dauerlauf (F2)" } else { "" };
             let line = format!("Monitor {hz}{mode}\nUI {} fps  ·  Web {} fps", stats.ui_fps, stats.web_fps);
             self.fps_label.set(fs, &line, 11.5 * s, &self.ui_family, false);
@@ -600,59 +759,84 @@ impl Ui {
 
         // Text zusammenstellen.
         let mut text = Vec::new();
-        let full = [0, 0, layout.width as i32, layout.height as i32];
-        for i in 0..6 {
-            let r = layout.buttons[i];
-            let l = &self.icons[i];
-            let disabled = (i == 0 && !page.can_back) || (i == 1 && !page.can_forward);
-            let color = if i == 5 && self.hover_anim[5] > 0.5 { Rgba::rgb(255, 255, 255) } else if disabled { t.dim.with_alpha(120) } else { t.text };
-            text.push(TextBlock {
-                buffer: &l.buffer,
-                x: (r.x + (r.w - l.width()) / 2.0).round(),
-                y: (r.y + (r.h - l.line_height()) / 2.0).round(),
-                color,
-                clip: Some(full),
-            });
+        let centered = |l: &'a Label, r: Rect, color: Rgba| TextBlock {
+            buffer: &l.buffer,
+            x: (r.x + (r.w - l.width()) / 2.0).round(),
+            y: (r.y + (r.h - l.line_height()) / 2.0).round(),
+            color,
+            clip: Some(side_clip),
+        };
+        for i in 0..TOP.len() {
+            let disabled = (TOP[i] == Hit::Back && !page.can_back) || (TOP[i] == Hit::Forward && !page.can_forward);
+            let color = if TOP[i] == Hit::Close && self.anim(Hit::Close) > 0.5 {
+                Rgba::rgb(255, 255, 255)
+            } else if disabled {
+                t.dim.with_alpha(120)
+            } else {
+                t.text
+            };
+            text.push(centered(&self.top_icons[i], layout.top[i], color));
         }
-        let icon = &self.icons[6];
-        text.push(TextBlock {
-            buffer: &icon.buffer,
-            x: (ur.x + 12.0 * s).round(),
-            y: (ur.y + (ur.h - icon.line_height()) / 2.0).round(),
-            color: if secure { t.dim } else { t.dim.with_alpha(160) },
-            clip: Some(full),
-        });
+        let left_icon = |l: &'a Label, r: Rect, color: Rgba| TextBlock {
+            buffer: &l.buffer,
+            x: (r.x + 12.0 * s).round(),
+            y: (r.y + (r.h - l.line_height()) / 2.0).round(),
+            color,
+            clip: Some(side_clip),
+        };
+        text.push(left_icon(&self.url_icon, ur, if secure { t.dim } else { t.dim.with_alpha(160) }));
         text.push(TextBlock {
             buffer: &self.url_label.buffer,
             x: text_left - self.url_scroll,
             y: url_y.round(),
             color: url_color,
-            clip: Some([text_left as i32, ur.y as i32, (text_left + text_w) as i32, (ur.y + ur.h) as i32]),
+            clip: Some([text_left.max(0.0) as i32, ur.y as i32, (text_left + text_w).max(0.0) as i32, (ur.y + ur.h) as i32]),
         });
         let lr = layout.tabs_label;
-        text.push(TextBlock { buffer: &self.tabs_label.buffer, x: lr.x, y: lr.y, color: t.dim, clip: Some(full) });
-        let ti = &self.icons[7];
-        text.push(TextBlock {
-            buffer: &ti.buffer,
-            x: (tr.x + 12.0 * s).round(),
-            y: (tr.y + (tr.h - ti.line_height()) / 2.0).round(),
-            color: t.dim,
-            clip: Some(full),
-        });
-        text.push(TextBlock {
-            buffer: &self.tab_label.buffer,
-            x: (tr.x + 34.0 * s).round(),
-            y: (tr.y + (tr.h - self.tab_label.line_height()) / 2.0).round(),
-            color: t.text,
-            clip: Some([tr.x as i32, tr.y as i32, (tr.x + tr.w - 8.0 * s) as i32, (tr.y + tr.h) as i32]),
-        });
-        if self.show_fps {
-            let fr = layout.fps;
-            text.push(TextBlock { buffer: &self.fps_label.buffer, x: fr.x, y: fr.y, color: t.dim, clip: Some(full) });
+        text.push(TextBlock { buffer: &self.tabs_label.buffer, x: lr.x, y: lr.y, color: t.dim, clip: Some(side_clip) });
+        for (i, state) in tabs.tabs.iter().enumerate() {
+            let r = layout.tabs[i];
+            let labels = &self.tab_labels[i];
+            if !state.loading {
+                text.push(left_icon(&labels.icon, r, t.dim));
+            }
+            let show_close = self.hovered(Hit::Tab(i)) || i == tabs.active;
+            let title_right = if show_close { close_rect(r, s).x - 4.0 * s } else { r.x + r.w - 8.0 * s };
+            text.push(TextBlock {
+                buffer: &labels.title.buffer,
+                x: (r.x + 34.0 * s).round(),
+                y: (r.y + (r.h - labels.title.line_height()) / 2.0).round(),
+                color: if i == tabs.active { t.text } else { lerp(t.dim, t.text, 0.6) },
+                clip: Some([r.x.max(0.0) as i32, r.y as i32, title_right.min(side_clip[2] as f32).max(0.0) as i32, (r.y + r.h) as i32]),
+            });
+            if show_close {
+                text.push(centered(&labels.close, close_rect(r, s), t.dim));
+            }
         }
-
+        text.push(left_icon(&self.new_tab_icon, nr, t.dim));
+        text.push(TextBlock {
+            buffer: &self.new_tab_label.buffer,
+            x: (nr.x + 34.0 * s).round(),
+            y: (nr.y + (nr.h - self.new_tab_label.line_height()) / 2.0).round(),
+            color: t.dim,
+            clip: Some(side_clip),
+        });
+        if self.show_fps && layout.reveal > 0.0 {
+            let fr = layout.fps;
+            text.push(TextBlock { buffer: &self.fps_label.buffer, x: fr.x, y: fr.y, color: t.dim, clip: Some(side_clip) });
+        }
         Frame { cards, under, text, over }
     }
+}
+
+/// Titel eines Tabs: Seitentitel, sonst Domain, sonst "Neuer Tab".
+pub fn tab_title(state: &PageState) -> String {
+    state
+        .title
+        .clone()
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| state.url.as_ref().and_then(|u| u.host_str().map(str::to_string)))
+        .unwrap_or_else(|| "Neuer Tab".into())
 }
 
 fn lerp(a: Rgba, b: Rgba, t: f32) -> Rgba {
@@ -665,16 +849,6 @@ fn pretty_url(url: &str) -> String {
     let s = url.strip_prefix("https://").unwrap_or(url);
     let s = s.strip_prefix("www.").unwrap_or(s);
     s.strip_suffix('/').unwrap_or(s).to_string()
-}
-
-fn ellipsize(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(max - 1).collect();
-        out.push('…');
-        out
-    }
 }
 
 /// Macht aus einer Eingabe in der Adressleiste eine URL: Adresse oder Suche (mit !Bangs).
@@ -731,5 +905,34 @@ mod tests {
         f.select_all();
         f.insert("x");
         assert_eq!(f.text, "x");
+    }
+
+    #[test]
+    fn seitenleiste_faehrt_aus() {
+        let tabs = 3;
+        let pinned = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 0.0, tabs);
+        assert_eq!(pinned.sidebar_x, 0.0);
+        assert_eq!(pinned.content.x, SIDEBAR_W);
+        assert_eq!(pinned.hit(100.0, pinned.tabs[1].y + 5.0, false), Hit::Tab(1));
+
+        let hidden = Layout::new(1600, 900, 1.0, SidebarMode::Hover, 0.0, tabs);
+        assert_eq!(hidden.sidebar_x, -SIDEBAR_W);
+        assert_eq!(hidden.content.x, GAP);
+        assert_eq!(hidden.hit(7.0, 400.0, false), Hit::Edge);
+        assert_eq!(hidden.hit(100.0, hidden.tabs[1].y + 5.0, false), Hit::Content);
+
+        // Die Seite behält im Hover-Modus ihre Breite, sie wird nur verschoben.
+        let shown = Layout::new(1600, 900, 1.0, SidebarMode::Hover, 1.0, tabs);
+        assert_eq!(shown.content.w, hidden.content.w);
+        assert_eq!(shown.content.x, SIDEBAR_W);
+        assert_eq!(shown.hit(100.0, shown.tabs[1].y + 5.0, false), Hit::Tab(1));
+    }
+
+    #[test]
+    fn tab_schliessen_knopf() {
+        let l = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 1.0, 2);
+        let c = close_rect(l.tabs[0], 1.0);
+        assert_eq!(l.hit(c.x + 2.0, c.y + 2.0, false), Hit::TabClose(0));
+        assert_eq!(l.hit(l.new_tab.x + 5.0, l.new_tab.y + 5.0, false), Hit::NewTab);
     }
 }

@@ -1,19 +1,22 @@
 //! Web-Engine hinter einer eigenen Schnittstelle. Jetzt Servo; später kommt WebView2 als
 //! automatischer Ersatz für Seiten dazu, die Servo noch nicht kann.
 //!
-//! Die Seite wird in ein eigenes Kind-Fenster gezeichnet. Windows setzt es mit der
-//! wgpu-Oberfläche des Hauptfensters zusammen, ohne dass Bilder kopiert werden müssen.
+//! Alle Tabs teilen sich ein Kind-Fenster mit einem OpenGL-Kontext. Servo zeigt darin nur die
+//! WebView des aktiven Tabs. Windows setzt das Kind-Fenster mit der wgpu-Oberfläche des
+//! Hauptfensters zusammen, ohne dass Bilder kopiert werden müssen.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use euclid::Scale;
 use servo::{
-    Cursor, DevicePoint, EventLoopWaker, InputEvent, LoadStatus, MouseButton, MouseButtonAction,
-    MouseButtonEvent, MouseLeftViewportEvent, MouseMoveEvent, RenderingContext, Servo, ServoBuilder,
-    WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
-    WindowRenderingContext, ConsoleLogLevel,
+    ConsoleLogLevel, CreateNewWebViewRequest, Cursor, DevicePoint, EventLoopWaker, InputEvent,
+    LoadStatus, MouseButton, MouseButtonAction, MouseButtonEvent, MouseLeftViewportEvent,
+    MouseMoveEvent, Opts, RenderingContext, Servo, ServoBuilder, WebView, WebViewBuilder,
+    WebViewDelegate, WebViewId, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
+    WindowRenderingContext,
 };
 use url::Url;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
@@ -23,10 +26,10 @@ use winit::keyboard::ModifiersState;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::{CursorIcon, Window, WindowId};
 
-use crate::ui::FpsCounter;
 use crate::UserEvent;
+use crate::ui::FpsCounter;
 
-/// Was die Oberfläche über die geladene Seite wissen muss.
+/// Was die Oberfläche über eine geladene Seite wissen muss.
 #[derive(Clone, Debug, Default)]
 pub struct PageState {
     pub url: Option<Url>,
@@ -36,27 +39,49 @@ pub struct PageState {
     pub can_forward: bool,
 }
 
-/// Eine Seite in einem Tab, unabhängig von der Engine dahinter.
-pub trait PageView {
+/// Was Vyre von einer Web-Engine braucht, unabhängig davon, welche es ist.
+/// Navigation und Eingaben betreffen immer den aktiven Tab.
+pub trait Engine {
+    /// Lässt die Engine anstehende Arbeit erledigen. `true`, wenn sich die Tab-Liste geändert
+    /// hat (von der Seite geöffnete oder geschlossene Tabs).
+    fn spin(&mut self) -> bool;
+
+    fn tabs(&self) -> Vec<PageState>;
+    fn active(&self) -> usize;
+    fn select(&mut self, index: usize);
+    /// Öffnet einen neuen Tab hinter dem aktiven und wählt ihn aus.
+    fn new_tab(&mut self, url: Url);
+    /// Schließt einen Tab. `false`, wenn danach keiner mehr übrig ist.
+    fn close_tab(&mut self, index: usize) -> bool;
+
     fn load(&self, url: Url);
     fn reload(&self);
     fn go_back(&self);
     fn go_forward(&self);
     fn state(&self) -> PageState;
+    fn set_focused(&self, focused: bool);
+
     /// Position und Größe des Seitenbereichs im Hauptfenster (physische Pixel).
     fn set_bounds(&self, x: i32, y: i32, width: u32, height: u32);
     fn set_scale(&self, scale: f64);
-    fn set_focused(&self, focused: bool);
-    /// Fenster, in das die Seite gezeichnet wird.
+    /// Fenster, in das die Seiten gezeichnet werden.
     fn window_id(&self) -> WindowId;
-    /// Ereignisse des eigenen Fensters (Maus, Neuzeichnen, Größe).
+    /// Ereignisse des Seitenfensters (Maus, Neuzeichnen, Größe).
     fn handle_window_event(&self, event: &WindowEvent);
     /// Tastatur (kommt über das Hauptfenster, das den Fokus behält).
     fn handle_key(&self, event: &KeyEvent, modifiers: ModifiersState);
-    /// Mausrad, wenn Windows es dem Hauptfenster statt dem Seitenfenster schickt.
+    /// Mausrad mit Position im Seitenbereich.
     fn wheel(&self, delta: MouseScrollDelta, x: f64, y: f64);
     /// Gezeichnete Seitenbilder in der letzten Sekunde.
     fn fps(&self) -> usize;
+}
+
+/// Ordner für Cookies, Speicher und Einstellungen: `%LOCALAPPDATA%\Vyre\Profil`.
+pub fn profile_dir() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("Vyre").join("Profil")
 }
 
 /// Weckt die winit-Ereignisschleife, wenn Servo Arbeit hat (wird aus Servo-Threads gerufen).
@@ -73,27 +98,44 @@ impl EventLoopWaker for Waker {
     }
 }
 
-/// Nimmt Servos Meldungen entgegen und hält den Seitenzustand für die Oberfläche bereit.
-struct Delegate {
-    state: RefCell<PageState>,
+/// Gemeinsamer Zustand aller Tabs, auf den Servos Meldungen zugreifen.
+struct Shared {
     child: Arc<Window>,
     main: Arc<Window>,
+    context: Rc<WindowRenderingContext>,
+    /// Von Seiten geöffnete Tabs (target="_blank", window.open), noch nicht in der Liste.
+    opened: RefCell<Vec<Tab>>,
+    /// Von Seiten geschlossene Tabs (window.close).
+    closed: RefCell<Vec<WebViewId>>,
+}
+
+/// Nimmt Servos Meldungen für einen Tab entgegen.
+struct Delegate {
+    state: RefCell<PageState>,
+    shared: Rc<Shared>,
 }
 
 impl Delegate {
+    fn new(shared: &Rc<Shared>, url: Option<Url>) -> Rc<Self> {
+        Rc::new(Self {
+            state: RefCell::new(PageState { url, loading: true, ..Default::default() }),
+            shared: shared.clone(),
+        })
+    }
+
     fn changed(&self, webview: &WebView) {
         {
             let mut s = self.state.borrow_mut();
             s.can_back = webview.can_go_back();
             s.can_forward = webview.can_go_forward();
         }
-        self.main.request_redraw();
+        self.shared.main.request_redraw();
     }
 }
 
 impl WebViewDelegate for Delegate {
     fn notify_new_frame_ready(&self, _webview: WebView) {
-        self.child.request_redraw();
+        self.shared.child.request_redraw();
     }
 
     fn notify_url_changed(&self, webview: WebView, url: Url) {
@@ -115,14 +157,34 @@ impl WebViewDelegate for Delegate {
         self.changed(&webview);
     }
 
-    fn notify_cursor_changed(&self, _webview: WebView, cursor: Cursor) {
+    fn notify_cursor_changed(&self, webview: WebView, cursor: Cursor) {
+        if !webview.focused() {
+            return; // Tab im Hintergrund
+        }
         match cursor_icon(cursor) {
             Some(icon) => {
-                self.child.set_cursor_visible(true);
-                self.child.set_cursor(icon);
+                self.shared.child.set_cursor_visible(true);
+                self.shared.child.set_cursor(icon);
             }
-            None => self.child.set_cursor_visible(false),
+            None => self.shared.child.set_cursor_visible(false),
         }
+    }
+
+    fn request_create_new(&self, _parent: WebView, request: CreateNewWebViewRequest) {
+        let shared = &self.shared;
+        let delegate = Delegate::new(shared, None);
+        let webview = request
+            .builder(shared.context.clone())
+            .hidpi_scale_factor(Scale::new(shared.child.scale_factor() as f32))
+            .delegate(delegate.clone())
+            .build();
+        shared.opened.borrow_mut().push(Tab { webview, delegate });
+        shared.main.request_redraw();
+    }
+
+    fn notify_closed(&self, webview: WebView) {
+        self.shared.closed.borrow_mut().push(webview.id());
+        self.shared.main.request_redraw();
     }
 
     fn show_console_message(&self, _webview: WebView, level: ConsoleLogLevel, message: String) {
@@ -135,19 +197,23 @@ impl WebViewDelegate for Delegate {
     }
 }
 
-/// Servo als Engine: eine Servo-Instanz, ein Seitenfenster mit einer WebView.
-pub struct ServoPage {
-    // Reihenfolge = Drop-Reihenfolge: zuerst die WebView, dann Servo, dann das Fenster.
+struct Tab {
     webview: WebView,
-    servo: Servo,
-    context: Rc<WindowRenderingContext>,
     delegate: Rc<Delegate>,
-    window: Arc<Window>,
-    pointer: RefCell<DevicePoint>,
+}
+
+/// Servo als Engine: eine Servo-Instanz, ein Seitenfenster, eine WebView pro Tab.
+pub struct ServoEngine {
+    // Reihenfolge = Drop-Reihenfolge: zuerst die Tabs, dann Servo, dann Fenster und Kontext.
+    tabs: Vec<Tab>,
+    active: usize,
+    servo: Servo,
+    shared: Rc<Shared>,
+    pointer: Cell<DevicePoint>,
     fps: RefCell<FpsCounter>,
 }
 
-impl ServoPage {
+impl ServoEngine {
     pub fn new(
         event_loop: &ActiveEventLoop,
         main: Arc<Window>,
@@ -164,115 +230,223 @@ impl ServoPage {
             .with_inner_size(PhysicalSize::new(w.max(1), h.max(1)));
         // SAFETY: Das Hauptfenster lebt länger als das Kind-Fenster (es wird zuletzt freigegeben).
         let attrs = unsafe { attrs.with_parent_window(Some(parent)) };
-        let window = Arc::new(event_loop.create_window(attrs).map_err(|e| e.to_string())?);
+        let child = Arc::new(event_loop.create_window(attrs).map_err(|e| e.to_string())?);
 
         let display = event_loop.display_handle().map_err(|e| e.to_string())?;
-        let handle = window.window_handle().map_err(|e| e.to_string())?;
+        let handle = child.window_handle().map_err(|e| e.to_string())?;
         let context = Rc::new(
-            WindowRenderingContext::new(display, handle, window.inner_size())
+            WindowRenderingContext::new(display, handle, child.inner_size())
                 .map_err(|e| format!("OpenGL-Kontext für Servo: {e:?}"))?,
         );
         let _ = context.make_current();
 
+        let profile = profile_dir();
+        if let Err(e) = std::fs::create_dir_all(&profile) {
+            log::warn!("Profilordner {} nicht anlegbar: {e}", profile.display());
+        }
+        let opts = Opts {
+            config_dir: Some(profile),
+            // Ein Absturz in einer Seite soll nicht den ganzen Browser beenden.
+            hard_fail: false,
+            ..Default::default()
+        };
         let servo = ServoBuilder::default()
+            .opts(opts)
             .event_loop_waker(Box::new(Waker(proxy)))
             .build();
 
-        let delegate = Rc::new(Delegate {
-            state: RefCell::new(PageState { url: Some(url.clone()), loading: true, ..Default::default() }),
-            child: window.clone(),
+        let shared = Rc::new(Shared {
+            child,
             main,
-        });
-        let webview = WebViewBuilder::new(&servo, context.clone())
-            .url(url)
-            .hidpi_scale_factor(Scale::new(window.scale_factor() as f32))
-            .delegate(delegate.clone())
-            .build();
-
-        Ok(Self {
-            webview,
-            servo,
             context,
-            delegate,
-            window,
-            pointer: RefCell::new(DevicePoint::new(0.0, 0.0)),
+            opened: RefCell::default(),
+            closed: RefCell::default(),
+        });
+        let mut engine = Self {
+            tabs: Vec::new(),
+            active: 0,
+            servo,
+            shared,
+            pointer: Cell::new(DevicePoint::new(0.0, 0.0)),
             fps: RefCell::new(FpsCounter::default()),
-        })
+        };
+        engine.new_tab(url);
+        Ok(engine)
     }
 
-    /// Lässt Servo anstehende Arbeit erledigen (nach jedem Ereignis und jedem Wecken).
-    pub fn spin(&self) {
-        self.servo.spin_event_loop();
+    fn tab(&self) -> Option<&Tab> {
+        self.tabs.get(self.active)
     }
 
     fn send(&self, event: InputEvent) {
-        self.webview.notify_input_event(event);
+        if let Some(t) = self.tab() {
+            t.webview.notify_input_event(event);
+        }
     }
 
     fn point(&self) -> WebViewPoint {
-        WebViewPoint::Device(*self.pointer.borrow())
+        WebViewPoint::Device(self.pointer.get())
+    }
+
+    /// Zeigt nur die WebView des aktiven Tabs.
+    fn show_active(&self) {
+        for (i, t) in self.tabs.iter().enumerate() {
+            if i == self.active {
+                t.webview.show();
+            } else {
+                t.webview.hide();
+                t.webview.set_focused(false);
+            }
+        }
+        self.shared.child.request_redraw();
+        self.shared.main.request_redraw();
+    }
+
+    fn insert(&mut self, tab: Tab) {
+        let at = (self.active + 1).min(self.tabs.len());
+        self.tabs.insert(at, tab);
+        self.active = at;
+        self.show_active();
     }
 }
 
-impl PageView for ServoPage {
+impl Engine for ServoEngine {
+    fn spin(&mut self) -> bool {
+        self.servo.spin_event_loop();
+        let opened: Vec<Tab> = self.shared.opened.borrow_mut().drain(..).collect();
+        let closed: Vec<WebViewId> = self.shared.closed.borrow_mut().drain(..).collect();
+        let changed = !opened.is_empty() || !closed.is_empty();
+        for tab in opened {
+            self.insert(tab);
+        }
+        for id in closed {
+            if let Some(i) = self.tabs.iter().position(|t| t.webview.id() == id) {
+                // Der letzte Tab bleibt offen, auch wenn die Seite sich schließt.
+                if self.tabs.len() > 1 {
+                    self.close_tab(i);
+                }
+            }
+        }
+        changed
+    }
+
+    fn tabs(&self) -> Vec<PageState> {
+        self.tabs.iter().map(|t| t.delegate.state.borrow().clone()).collect()
+    }
+
+    fn active(&self) -> usize {
+        self.active
+    }
+
+    fn select(&mut self, index: usize) {
+        if index < self.tabs.len() && index != self.active {
+            self.active = index;
+            self.show_active();
+        }
+    }
+
+    fn new_tab(&mut self, url: Url) {
+        let delegate = Delegate::new(&self.shared, Some(url.clone()));
+        let webview = WebViewBuilder::new(&self.servo, self.shared.context.clone())
+            .url(url)
+            .hidpi_scale_factor(Scale::new(self.shared.child.scale_factor() as f32))
+            .delegate(delegate.clone())
+            .build();
+        self.insert(Tab { webview, delegate });
+    }
+
+    fn close_tab(&mut self, index: usize) -> bool {
+        if index >= self.tabs.len() {
+            return !self.tabs.is_empty();
+        }
+        self.tabs.remove(index);
+        if self.tabs.is_empty() {
+            return false;
+        }
+        // Wie in Firefox/Zen: nach dem Schließen den rechten (hier: unteren) Nachbarn zeigen.
+        if index < self.active || self.active >= self.tabs.len() {
+            self.active = self.active.saturating_sub(1).min(self.tabs.len() - 1);
+        }
+        self.show_active();
+        true
+    }
+
     fn load(&self, url: Url) {
-        self.webview.load(url);
+        if let Some(t) = self.tab() {
+            t.webview.load(url);
+        }
     }
 
     fn reload(&self) {
-        self.webview.reload();
+        if let Some(t) = self.tab() {
+            t.webview.reload();
+        }
     }
 
     fn go_back(&self) {
-        if self.webview.can_go_back() {
-            self.webview.go_back(1);
+        if let Some(t) = self.tab().filter(|t| t.webview.can_go_back()) {
+            t.webview.go_back(1);
         }
     }
 
     fn go_forward(&self) {
-        if self.webview.can_go_forward() {
-            self.webview.go_forward(1);
+        if let Some(t) = self.tab().filter(|t| t.webview.can_go_forward()) {
+            t.webview.go_forward(1);
         }
     }
 
     fn state(&self) -> PageState {
-        self.delegate.state.borrow().clone()
+        self.tab().map(|t| t.delegate.state.borrow().clone()).unwrap_or_default()
+    }
+
+    fn set_focused(&self, focused: bool) {
+        if let Some(t) = self.tab() {
+            t.webview.set_focused(focused);
+        }
     }
 
     fn set_bounds(&self, x: i32, y: i32, width: u32, height: u32) {
+        let child = &self.shared.child;
         let size = PhysicalSize::new(width.max(1), height.max(1));
-        self.window.set_outer_position(PhysicalPosition::new(x, y));
-        if self.window.inner_size() != size {
-            let _ = self.window.request_inner_size(size);
-            self.webview.resize(size);
+        if child.outer_position().ok() != Some(PhysicalPosition::new(x, y)) {
+            child.set_outer_position(PhysicalPosition::new(x, y));
+        }
+        if child.inner_size() != size {
+            let _ = child.request_inner_size(size);
+            // Alle WebViews teilen sich den Kontext; eine Größenänderung gilt für alle.
+            if let Some(t) = self.tabs.first() {
+                t.webview.resize(size);
+            }
         }
     }
 
     fn set_scale(&self, scale: f64) {
-        self.webview.set_hidpi_scale_factor(Scale::new(scale as f32));
-    }
-
-    fn set_focused(&self, focused: bool) {
-        self.webview.set_focused(focused);
+        for t in &self.tabs {
+            t.webview.set_hidpi_scale_factor(Scale::new(scale as f32));
+        }
     }
 
     fn window_id(&self) -> WindowId {
-        self.window.id()
+        self.shared.child.id()
     }
 
     fn handle_window_event(&self, event: &WindowEvent) {
         match event {
             WindowEvent::RedrawRequested => {
-                let _ = self.context.make_current();
-                self.webview.paint();
-                self.context.present();
-                self.fps.borrow_mut().tick();
+                if let Some(t) = self.tab() {
+                    let _ = self.shared.context.make_current();
+                    t.webview.paint();
+                    self.shared.context.present();
+                    self.fps.borrow_mut().tick();
+                }
             }
             WindowEvent::Resized(size) => {
-                self.webview.resize(*size);
+                if let Some(t) = self.tabs.first() {
+                    t.webview.resize(*size);
+                }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                *self.pointer.borrow_mut() = DevicePoint::new(position.x as f32, position.y as f32);
+                self.pointer.set(DevicePoint::new(position.x as f32, position.y as f32));
                 self.send(InputEvent::MouseMove(MouseMoveEvent::new(self.point())));
             }
             WindowEvent::CursorLeft { .. } => {
@@ -294,7 +468,7 @@ impl PageView for ServoPage {
                 self.send(InputEvent::MouseButton(MouseButtonEvent::new(action, button, self.point())));
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let p = *self.pointer.borrow();
+                let p = self.pointer.get();
                 self.wheel(*delta, p.x as f64, p.y as f64);
             }
             _ => {}

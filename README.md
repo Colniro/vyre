@@ -20,12 +20,28 @@ Der erste Build dauert lange, weil Servo mitgebaut wird. SpiderMonkey wird ferti
 | Alt+← / Alt+→ | Zurück / Vor |
 | F2 | Dauerlauf: misst die höchste Bildrate der Oberfläche |
 | F3 | FPS-Anzeige ein/aus |
-| Strg+W | Schließen |
+| Strg+T | Neuer Tab |
+| Strg+W, Mittelklick auf Tab | Tab schließen (der letzte schließt Vyre) |
+| Strg+Tab / Strg+Umschalt+Tab | Nächster / vorheriger Tab |
+| Strg+1 … 8, Strg+9 | Zu Tab 1 … 8, zum letzten Tab |
+| Strg+B | Seitenleiste: fest ↔ beim Hovern ausfahren |
+
+## Seitenleiste
+
+Zwei Modi, umschaltbar mit dem Knopf oben in der Leiste oder Strg+B:
+
+- **fest**: immer sichtbar, die Seite steht daneben.
+- **hover**: eingeklappt; fährt aus, wenn die Maus an den linken Fensterrand kommt, und nach
+  kurzer Zeit wieder ein. Die Seite wird dabei nur verschoben, nicht neu umbrochen.
+
+Die Wahl steht in `%LOCALAPPDATA%\Vyre\einstellungen.txt`. Cookies und Seitenspeicher liegen in
+`%LOCALAPPDATA%\Vyre\Profil`.
 
 ## Aufbau
 
-- `src/main.rs`: Fenster, Ereignisse, Fokus, Tastenkürzel
-- `src/ui.rs`: Seitenleiste, Adressleiste, Animationen, FPS-Zähler
-- `src/engine.rs`: Engine-Schnittstelle `PageView` und die Servo-Anbindung (eigenes Kind-Fenster)
+- `src/main.rs`: Fenster, Ereignisse, Fokus, Tastenkürzel, Ein-/Ausfahren der Seitenleiste
+- `src/ui.rs`: Layout, Seitenleiste mit Tab-Liste, Adressleiste, Animationen, FPS-Zähler
+- `src/engine.rs`: Engine-Schnittstelle `Engine` und die Servo-Anbindung (ein Kind-Fenster für alle Tabs)
+- `src/settings.rs`: gespeicherte Einstellungen
 - `src/render/`: GPU-Zeichnen (aus Wyven übernommen)
 - `src/keys.rs`, `src/win.rs`: Tastenübersetzung, Windows-11-Fenstereffekte

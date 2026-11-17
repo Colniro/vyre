@@ -1,12 +1,13 @@
 //! Vyre – ein schlanker Browser in Rust auf Basis von Servo.
 //!
 //! Aufbau: Das rahmenlose Hauptfenster zeichnet die Oberfläche mit wgpu (Seitenleiste wie bei
-//! Zen). Die Webseite liegt in einem Kind-Fenster, in das Servo mit OpenGL zeichnet.
+//! Zen). Die Webseiten liegen in einem Kind-Fenster, in das Servo mit OpenGL zeichnet.
 //! Die Tastatur bleibt beim Hauptfenster und wird je nach Fokus an die Seite weitergereicht.
 
 mod engine;
 mod keys;
 mod render;
+mod settings;
 mod ui;
 #[cfg(windows)]
 mod win;
@@ -14,9 +15,10 @@ mod win;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use engine::{PageView, ServoPage};
+use engine::{Engine, ServoEngine};
 use render::{RoundRect, Scene};
-use ui::{FpsCounter, Hit, Layout, Stats, THEME, Ui};
+use settings::Settings;
+use ui::{FpsCounter, Hit, Layout, SidebarMode, Stats, TabsView, THEME, Ui};
 use url::Url;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -32,8 +34,13 @@ pub enum UserEvent {
 }
 
 const START_PAGE: &str = "https://servo.org/";
+const NEW_TAB_PAGE: &str = "about:blank";
 /// So oft wird die FPS-Anzeige auch ohne andere Änderungen aufgefrischt.
 const STATS_REFRESH: Duration = Duration::from_millis(500);
+/// So lange bleibt die ausgefahrene Seitenleiste stehen, nachdem die Maus sie verlassen hat.
+const SIDEBAR_LINGER: Duration = Duration::from_millis(350);
+/// Zeitkonstante des Ein-/Ausfahrens (etwa 3x so lang bis ganz da).
+const SIDEBAR_TAU: f32 = 0.045;
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,vyre=info"))
@@ -57,12 +64,68 @@ struct App {
     browser: Option<Browser>,
 }
 
+/// Ein- und Ausfahren der Seitenleiste im Hover-Modus.
+struct Sidebar {
+    mode: SidebarMode,
+    /// Aktueller Wert 0..1 (animiert).
+    reveal: f32,
+    /// Soll sie ausgefahren sein?
+    wanted: bool,
+    /// Seit wann die Maus die ausgefahrene Leiste verlassen hat.
+    left_at: Option<Instant>,
+    last_step: Instant,
+}
+
+impl Sidebar {
+    fn new(mode: SidebarMode) -> Self {
+        let reveal = if mode == SidebarMode::Pinned { 1.0 } else { 0.0 };
+        Self { mode, reveal, wanted: false, left_at: None, last_step: Instant::now() }
+    }
+
+    fn show(&mut self) {
+        self.wanted = true;
+        self.left_at = None;
+    }
+
+    fn mouse_left(&mut self) {
+        if self.wanted {
+            self.left_at.get_or_insert_with(Instant::now);
+        }
+    }
+
+    /// Schreitet die Animation voran; `true`, solange sie läuft oder auf das Einfahren wartet.
+    fn step(&mut self, keep_open: bool) -> bool {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_step).as_secs_f32().min(0.05);
+        self.last_step = now;
+        if self.mode == SidebarMode::Pinned {
+            self.reveal = 1.0;
+            return false;
+        }
+        if keep_open {
+            self.show();
+        } else if self.left_at.is_some_and(|t| now.duration_since(t) >= SIDEBAR_LINGER) {
+            self.wanted = false;
+            self.left_at = None;
+        }
+        let target = if self.wanted { 1.0 } else { 0.0 };
+        let k = 1.0 - (-dt / SIDEBAR_TAU).exp();
+        self.reveal += (target - self.reveal) * k;
+        if (target - self.reveal).abs() < 0.002 {
+            self.reveal = target;
+        }
+        self.reveal != target || self.left_at.is_some()
+    }
+}
+
 struct Browser {
-    // Freigabe-Reihenfolge: Seite (Servo + Kind-Fenster), dann GPU, dann Hauptfenster.
-    page: ServoPage,
+    // Freigabe-Reihenfolge: Engine (Servo + Kind-Fenster), dann GPU, dann Hauptfenster.
+    engine: ServoEngine,
     renderer: render::Renderer,
     ui: Ui,
     layout: Layout,
+    sidebar: Sidebar,
+    settings: Settings,
     modifiers: ModifiersState,
     cursor: (f32, f32),
     ui_fps: FpsCounter,
@@ -89,19 +152,19 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
-        if let (Some(b), UserEvent::ServoWake) = (&self.browser, event) {
-            b.page.spin();
+        if let (Some(b), UserEvent::ServoWake) = (&mut self.browser, event) {
+            b.spin();
         }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         let Some(b) = &mut self.browser else { return };
-        if id == b.page.window_id() {
+        if id == b.engine.window_id() {
             b.page_window_event(&event);
         } else {
             b.main_window_event(event_loop, event);
         }
-        b.page.spin();
+        b.spin();
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -116,6 +179,12 @@ impl ApplicationHandler<UserEvent> for App {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(b) = &self.browser {
+            b.settings.save();
+        }
+    }
 }
 
 fn to_bounds(r: ui::Rect) -> (i32, i32, u32, u32) {
@@ -124,6 +193,7 @@ fn to_bounds(r: ui::Rect) -> (i32, i32, u32, u32) {
 
 impl Browser {
     fn new(event_loop: &ActiveEventLoop, proxy: EventLoopProxy<UserEvent>, start: Url) -> Result<Self, String> {
+        let settings = Settings::load();
         let attrs = Window::default_attributes()
             .with_title("Vyre")
             .with_decorations(false)
@@ -138,11 +208,12 @@ impl Browser {
         let mut renderer = pollster::block_on(render::Renderer::new(window.clone(), event_loop.owned_display_handle()));
         log::info!("GPU bereit nach {:?}: {:?}", t.elapsed(), renderer.gpu_info());
         let ui = Ui::new(renderer.font_system());
+        let sidebar = Sidebar::new(settings.sidebar);
         let size = window.inner_size();
-        let layout = Layout::new(size.width, size.height, window.scale_factor() as f32);
+        let layout = Layout::new(size.width, size.height, window.scale_factor() as f32, sidebar.mode, sidebar.reveal, 1);
 
         let t = Instant::now();
-        let page = ServoPage::new(event_loop, window.clone(), proxy, to_bounds(layout.content), start)?;
+        let engine = ServoEngine::new(event_loop, window.clone(), proxy, to_bounds(layout.content), start)?;
         log::info!("Servo bereit nach {:?}", t.elapsed());
 
         let refresh_hz = window
@@ -152,10 +223,12 @@ impl Browser {
         window.set_visible(true);
         window.request_redraw();
         Ok(Self {
-            page,
+            engine,
             renderer,
             ui,
             layout,
+            sidebar,
+            settings,
             modifiers: ModifiersState::empty(),
             cursor: (0.0, 0.0),
             ui_fps: FpsCounter::default(),
@@ -167,14 +240,30 @@ impl Browser {
         })
     }
 
+    fn spin(&mut self) {
+        if self.engine.spin() {
+            self.relayout();
+        }
+    }
+
     fn page_window_event(&mut self, event: &WindowEvent) {
-        if let WindowEvent::MouseInput { state: ElementState::Pressed, .. } = event {
-            self.focus_page();
+        match event {
+            WindowEvent::MouseInput { state: ElementState::Pressed, .. } => self.focus_page(),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.set_hover(Hit::Content);
+                // Ganz links in der Seite zählt wie der Rand: Seitenleiste ausfahren.
+                if self.sidebar.mode == SidebarMode::Hover {
+                    if position.x < 3.0 * self.layout.scale as f64 {
+                        self.sidebar.show();
+                    } else {
+                        self.sidebar.mouse_left();
+                    }
+                    self.window.request_redraw();
+                }
+            }
+            _ => {}
         }
-        if let WindowEvent::CursorMoved { .. } = event {
-            self.set_hover(Hit::Content);
-        }
-        self.page.handle_window_event(event);
+        self.engine.handle_window_event(event);
     }
 
     fn main_window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
@@ -185,7 +274,7 @@ impl Browser {
                 self.relayout();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                self.page.set_scale(scale_factor);
+                self.engine.set_scale(scale_factor);
                 self.relayout();
             }
             WindowEvent::Moved(_) => {
@@ -198,8 +287,16 @@ impl Browser {
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x as f32, position.y as f32);
-                let hit = self.layout.hit(self.cursor.0, self.cursor.1, self.window.is_maximized());
+                let hit = self.hit();
                 self.set_hover(hit);
+                if self.sidebar.mode == SidebarMode::Hover {
+                    if hit == Hit::Edge || self.layout.over_sidebar(self.cursor.0) {
+                        self.sidebar.show();
+                    } else {
+                        self.sidebar.mouse_left();
+                    }
+                    self.window.request_redraw();
+                }
                 self.window.set_cursor(match hit {
                     Hit::Resize(d) => resize_cursor(d),
                     Hit::UrlBar => CursorIcon::Text,
@@ -211,15 +308,26 @@ impl Browser {
                     self.window.request_redraw();
                 }
             }
-            WindowEvent::CursorLeft { .. } => self.set_hover(Hit::Nothing),
-            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
-                ElementState::Pressed => self.press(),
-                ElementState::Released => self.release(event_loop),
+            WindowEvent::CursorLeft { .. } => {
+                self.set_hover(Hit::Nothing);
+                self.sidebar.mouse_left();
+                self.window.request_redraw();
+            }
+            WindowEvent::MouseInput { state, button, .. } => match (button, state) {
+                (MouseButton::Left, ElementState::Pressed) => self.press(),
+                (MouseButton::Left, ElementState::Released) => self.release(event_loop),
+                (MouseButton::Middle, ElementState::Released) => {
+                    // Mittelklick auf einen Tab schließt ihn.
+                    if let Hit::Tab(i) | Hit::TabClose(i) = self.hit() {
+                        self.close_tab(event_loop, i);
+                    }
+                }
+                _ => {}
             },
             WindowEvent::MouseWheel { delta, .. } => {
                 let c = self.layout.content;
                 if c.contains(self.cursor.0, self.cursor.1) {
-                    self.page.wheel(delta, (self.cursor.0 - c.x) as f64, (self.cursor.1 - c.y) as f64);
+                    self.engine.wheel(delta, (self.cursor.0 - c.x) as f64, (self.cursor.1 - c.y) as f64);
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => self.key(event_loop, event),
@@ -228,14 +336,26 @@ impl Browser {
         }
     }
 
+    fn hit(&self) -> Hit {
+        self.layout.hit(self.cursor.0, self.cursor.1, self.window.is_maximized())
+    }
+
+    /// Berechnet die Positionen neu und schiebt das Seitenfenster an seinen Platz.
     fn relayout(&mut self) {
         let size = self.window.inner_size();
         if size.width == 0 || size.height == 0 {
             return;
         }
-        self.layout = Layout::new(size.width, size.height, self.window.scale_factor() as f32);
+        self.layout = Layout::new(
+            size.width,
+            size.height,
+            self.window.scale_factor() as f32,
+            self.sidebar.mode,
+            self.sidebar.reveal,
+            self.engine.tabs().len(),
+        );
         let (x, y, w, h) = to_bounds(self.layout.content);
-        self.page.set_bounds(x, y, w, h);
+        self.engine.set_bounds(x, y, w, h);
         self.window.request_redraw();
     }
 
@@ -247,12 +367,16 @@ impl Browser {
     }
 
     fn focus_url(&mut self) {
-        let state = self.page.state();
-        let text = state.url.as_ref().map(|u| u.as_str().to_string()).unwrap_or_default();
-        self.ui.url.set(&Ui::display_url(&state).is_empty().then(String::new).unwrap_or(text));
+        let state = self.engine.state();
+        let text = if Ui::display_url(&state).is_empty() {
+            String::new()
+        } else {
+            state.url.as_ref().map(|u| u.as_str().to_string()).unwrap_or_default()
+        };
+        self.ui.url.set(&text);
         self.ui.url.select_all();
         self.ui.url_focused = true;
-        self.page.set_focused(false);
+        self.engine.set_focused(false);
         self.window.request_redraw();
     }
 
@@ -261,11 +385,50 @@ impl Browser {
             self.ui.url_focused = false;
             self.window.request_redraw();
         }
-        self.page.set_focused(true);
+        self.engine.set_focused(true);
+    }
+
+    fn new_tab(&mut self) {
+        self.engine.new_tab(Url::parse(NEW_TAB_PAGE).expect("gültige URL"));
+        self.relayout();
+        self.sidebar.show();
+        self.focus_url();
+    }
+
+    fn close_tab(&mut self, event_loop: &ActiveEventLoop, index: usize) {
+        if !self.engine.close_tab(index) {
+            event_loop.exit();
+            return;
+        }
+        self.relayout();
+        if self.ui.url_focused {
+            self.focus_url();
+        }
+    }
+
+    fn select_tab(&mut self, index: usize) {
+        self.engine.select(index);
+        if self.ui.url_focused {
+            self.focus_url();
+        } else {
+            self.engine.set_focused(true);
+        }
+        self.window.request_redraw();
+    }
+
+    fn toggle_sidebar(&mut self) {
+        self.sidebar.mode = self.sidebar.mode.toggled();
+        self.settings.sidebar = self.sidebar.mode;
+        self.settings.save();
+        // Beim Wechsel zu "hover" bleibt die Leiste erst einmal stehen, bis die Maus geht.
+        self.sidebar.reveal = 1.0;
+        self.sidebar.show();
+        self.sidebar.mouse_left();
+        self.relayout();
     }
 
     fn press(&mut self) {
-        let hit = self.layout.hit(self.cursor.0, self.cursor.1, self.window.is_maximized());
+        let hit = self.hit();
         let now = Instant::now();
         let double = self
             .last_click
@@ -293,7 +456,12 @@ impl Browser {
                 }
                 self.ui.pressed = Some(hit);
             }
-            Hit::Nothing | Hit::Content => self.focus_page(),
+            Hit::Tab(i) => {
+                // Tabs wechseln schon beim Drücken, das fühlt sich schneller an.
+                self.select_tab(i);
+                self.ui.pressed = Some(hit);
+            }
+            Hit::Nothing | Hit::Content | Hit::Edge => self.focus_page(),
             _ => self.ui.pressed = Some(hit),
         }
         self.window.request_redraw();
@@ -306,83 +474,82 @@ impl Browser {
             return;
         }
         match self.ui.hover {
-            Hit::Back => self.page.go_back(),
-            Hit::Forward => self.page.go_forward(),
-            Hit::Reload => self.page.reload(),
+            Hit::Back => self.engine.go_back(),
+            Hit::Forward => self.engine.go_forward(),
+            Hit::Reload => self.engine.reload(),
+            Hit::SidebarToggle => self.toggle_sidebar(),
             Hit::Minimize => self.window.set_minimized(true),
             Hit::Maximize => self.window.set_maximized(!self.window.is_maximized()),
             Hit::Close => event_loop.exit(),
-            Hit::Tab => self.focus_page(),
+            Hit::TabClose(i) => self.close_tab(event_loop, i),
+            Hit::NewTab => self.new_tab(),
             _ => {}
         }
     }
 
-    fn key(&mut self, event_loop: &ActiveEventLoop, event: KeyEvent) {
-        let pressed = event.state == ElementState::Pressed;
+    /// Tastenkürzel des Browsers; `true`, wenn die Taste verbraucht wurde.
+    fn shortcut(&mut self, event_loop: &ActiveEventLoop, key: &Key) -> bool {
         let ctrl = self.modifiers.control_key();
         let alt = self.modifiers.alt_key();
         let shift = self.modifiers.shift_key();
-
-        // Tastenkürzel des Browsers, egal wo der Fokus ist.
-        if pressed {
-            let handled = match &event.logical_key {
-                Key::Character(c) if ctrl && c.eq_ignore_ascii_case("l") => {
-                    self.focus_url();
-                    true
-                }
-                Key::Named(NamedKey::F6) => {
-                    self.focus_url();
-                    true
-                }
-                Key::Named(NamedKey::F5) => {
-                    self.page.reload();
-                    true
-                }
-                Key::Character(c) if ctrl && c.eq_ignore_ascii_case("r") => {
-                    self.page.reload();
-                    true
-                }
-                Key::Named(NamedKey::ArrowLeft) if alt => {
-                    self.page.go_back();
-                    true
-                }
-                Key::Named(NamedKey::ArrowRight) if alt => {
-                    self.page.go_forward();
-                    true
-                }
-                Key::Named(NamedKey::F2) => {
-                    self.bench = !self.bench;
-                    self.window.request_redraw();
-                    true
-                }
-                Key::Named(NamedKey::F3) => {
-                    self.ui.show_fps = !self.ui.show_fps;
-                    self.window.request_redraw();
-                    true
-                }
-                Key::Character(c) if ctrl && c.eq_ignore_ascii_case("w") => {
-                    event_loop.exit();
-                    true
-                }
-                _ => false,
-            };
-            if handled {
-                return;
+        let char_is = |c: &str, want: &str| c.eq_ignore_ascii_case(want);
+        match key {
+            Key::Character(c) if ctrl && char_is(c, "l") => self.focus_url(),
+            Key::Named(NamedKey::F6) => self.focus_url(),
+            Key::Named(NamedKey::F5) => self.engine.reload(),
+            Key::Character(c) if ctrl && char_is(c, "r") => self.engine.reload(),
+            Key::Named(NamedKey::ArrowLeft) if alt => self.engine.go_back(),
+            Key::Named(NamedKey::ArrowRight) if alt => self.engine.go_forward(),
+            Key::Character(c) if ctrl && char_is(c, "t") => self.new_tab(),
+            Key::Character(c) if ctrl && char_is(c, "w") => {
+                let i = self.engine.active();
+                self.close_tab(event_loop, i);
             }
+            Key::Character(c) if ctrl && char_is(c, "b") => self.toggle_sidebar(),
+            Key::Named(NamedKey::Tab) if ctrl => {
+                let n = self.engine.tabs().len();
+                let a = self.engine.active();
+                self.select_tab(if shift { (a + n - 1) % n } else { (a + 1) % n });
+            }
+            // Strg+1..8 springt zum Tab, Strg+9 zum letzten.
+            Key::Character(c) if ctrl && c.len() == 1 && ('1'..='9').contains(&c.chars().next().unwrap()) => {
+                let n = self.engine.tabs().len();
+                let d = c.chars().next().unwrap().to_digit(10).unwrap() as usize;
+                self.select_tab(if d == 9 { n - 1 } else { (d - 1).min(n - 1) });
+            }
+            Key::Named(NamedKey::F2) => {
+                self.bench = !self.bench;
+                self.window.request_redraw();
+            }
+            Key::Named(NamedKey::F3) => {
+                self.ui.show_fps = !self.ui.show_fps;
+                self.window.request_redraw();
+            }
+            _ => return false,
         }
+        true
+    }
 
+    fn key(&mut self, event_loop: &ActiveEventLoop, event: KeyEvent) {
+        let pressed = event.state == ElementState::Pressed;
+        if pressed && self.shortcut(event_loop, &event.logical_key) {
+            return;
+        }
         if !self.ui.url_focused {
-            self.page.handle_key(&event, self.modifiers);
+            self.engine.handle_key(&event, self.modifiers);
             return;
         }
         if !pressed {
             return;
         }
+        let ctrl = self.modifiers.control_key();
+        let alt = self.modifiers.alt_key();
+        let shift = self.modifiers.shift_key();
         let field = &mut self.ui.url;
         match &event.logical_key {
             Key::Named(NamedKey::Enter) => {
                 if let Some(url) = ui::resolve_input(&field.text) {
-                    self.page.load(url);
+                    self.engine.load(url);
                 }
                 self.focus_page();
             }
@@ -420,16 +587,25 @@ impl Browser {
     }
 
     fn draw(&mut self) {
-        let state = self.page.state();
-        let animating = self.ui.animate(&state);
+        // Seitenleiste: offen halten, solange in der Adressleiste getippt wird.
+        let sliding = self.sidebar.step(self.ui.url_focused);
+        if sliding || self.layout.reveal != self.sidebar.reveal {
+            self.relayout();
+        }
+
+        let tabs = self.engine.tabs();
+        let active = self.engine.active();
+        let page = tabs.get(active).cloned().unwrap_or_default();
+        let animating = self.ui.animate(&page) || sliding;
         let stats = Stats {
             ui_fps: self.ui_fps.fps(),
-            web_fps: self.page.fps(),
+            web_fps: self.engine.fps(),
             refresh_hz: self.refresh_hz,
             bench: self.bench,
             maximized: self.window.is_maximized(),
         };
-        let mut frame = self.ui.build(self.renderer.font_system(), &self.layout, &state, &stats);
+        let view = TabsView { tabs: &tabs, active };
+        let mut frame = self.ui.build(self.renderer.font_system(), &self.layout, &view, &stats);
         // Weicher Schatten unter dem Seitenbereich.
         let c = self.layout.content;
         let s = self.layout.scale;

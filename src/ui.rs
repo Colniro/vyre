@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use winit::window::ResizeDirection;
 
-use crate::engine::PageState;
+use crate::engine::{PageState, Row};
 use crate::history::Favorite;
 use crate::render::{Attrs, Buffer, Family, FontSystem, Metrics, Quad, RoundRect, Rgba, Shaping, TextBlock, Weight, Wrap};
 
@@ -118,6 +118,8 @@ pub enum Hit {
     NewTab,
     /// Linker Rand im Hover-Modus: lässt die Seitenleiste ausfahren.
     Edge,
+    /// Trennlinie zwischen den Hälften einer geteilten Ansicht (zum Ziehen).
+    Divider,
     Drag,
     Resize(ResizeDirection),
     Content,
@@ -157,7 +159,21 @@ pub struct Layout {
     /// Vorschläge, schwebend unter der Adressleiste.
     pub suggestions: Vec<Rect>,
     pub tabs_label: Rect,
+    /// Fläche jedes Tabs (bei Paaren die jeweilige Hälfte der Zeile).
     pub tabs: Vec<Rect>,
+    /// Zeilen der Tab-Liste mit ihrer ganzen Fläche.
+    pub rows: Vec<(Row, Rect)>,
+    /// Die beiden Hälften einer geteilten Ansicht.
+    pub panes: Option<(Rect, Rect)>,
+    /// Spalt zwischen den Hälften (zum Ziehen der Trennlinie).
+    pub divider: Option<Rect>,
+    /// Beim Ziehen eines Tabs auf die Seite: wo er landen würde.
+    pub drop_zone: Option<Rect>,
+    /// Fläche, die die Engine für die Seite(n) bekommt.
+    pub page: Rect,
+    row_x: f32,
+    row_w: f32,
+    first_row_y: f32,
     pub new_tab: Rect,
     pub content: Rect,
     pub fps: Rect,
@@ -247,11 +263,61 @@ impl Layout {
             favorites,
             suggestions,
             tabs_label,
+            rows: (0..tab_count).map(|i| (Row::Single(i), row(i))).collect(),
             tabs,
             new_tab,
             content,
+            panes: None,
+            divider: None,
+            drop_zone: None,
+            page: content,
+            row_x: sx + pad,
+            row_w: sw - 2.0 * pad,
+            first_row_y: first,
             fps,
         }
+    }
+
+    /// Ordnet die Tab-Zeilen (Paare teilen sich eine Zeile) und den Seitenbereich für eine geteilte
+    /// Ansicht bzw. die Vorschau beim Ziehen eines Tabs auf die Seite (`drop`: rechts = `true`).
+    pub fn with_split(mut self, rows: &[Row], split: Option<f32>, drop: Option<bool>) -> Self {
+        let s = self.scale;
+        if !rows.is_empty() {
+            let step = (TAB_H + TAB_SPACING) * s;
+            let n = rows.iter().map(|r| match r { Row::Single(i) | Row::Pair(_, i) => i + 1 }).max().unwrap_or(0);
+            let mut tabs = vec![Rect::default(); n];
+            self.rows.clear();
+            for (k, row) in rows.iter().enumerate() {
+                let r = Rect { x: self.row_x, y: self.first_row_y + k as f32 * step, w: self.row_w, h: TAB_H * s };
+                match *row {
+                    Row::Single(i) => tabs[i] = r,
+                    Row::Pair(a, b) => {
+                        let half = (r.w / 2.0).floor();
+                        tabs[a] = Rect { w: half, ..r };
+                        tabs[b] = Rect { x: r.x + half, w: r.w - half, ..r };
+                    }
+                }
+                self.rows.push((*row, r));
+            }
+            self.tabs = tabs;
+            self.new_tab = Rect { x: self.row_x, y: self.first_row_y + rows.len() as f32 * step, w: self.row_w, h: TAB_H * s };
+        }
+        let c = self.content;
+        if let Some(right) = drop {
+            // Vorschau: die Seite rückt zur Seite, der gezogene Tab bekommt die andere Hälfte.
+            let (l, r) = split_rects(c, 0.5, s);
+            let (zone, page) = if right { (r, l) } else { (l, r) };
+            self.drop_zone = Some(zone);
+            self.page = page;
+        } else {
+            self.page = c;
+        }
+        if let (Some(ratio), None) = (split, drop) {
+            let (l, r) = split_rects(c, ratio, s);
+            self.panes = Some((l, r));
+            self.divider = Some(Rect { x: l.x + l.w - 3.0 * s, y: c.y, w: r.x - (l.x + l.w) + 6.0 * s, h: c.h });
+        }
+        self
     }
 
     /// Liegt der Punkt über der (sichtbaren) Seitenleiste?
@@ -317,6 +383,9 @@ impl Layout {
                 return Hit::NewTab;
             }
         }
+        if self.divider.is_some_and(|d| d.contains(x, y)) {
+            return Hit::Divider;
+        }
         if self.content.contains(x, y) {
             return Hit::Content;
         }
@@ -326,6 +395,16 @@ impl Layout {
         // Freie Flächen der Seitenleiste und der Rand verschieben das Fenster.
         Hit::Drag
     }
+}
+
+/// Teilt eine Fläche in zwei Hälften nebeneinander, mit einem Spalt dazwischen.
+/// `ratio` ist der Anteil der linken Hälfte.
+pub fn split_rects(c: Rect, ratio: f32, scale: f32) -> (Rect, Rect) {
+    let gap = (GAP * scale).round();
+    let left_w = ((c.w - gap) * ratio.clamp(0.05, 0.95)).round();
+    let left = Rect { w: left_w, ..c };
+    let right = Rect { x: c.x + left_w + gap, w: (c.w - left_w - gap).max(1.0), ..c };
+    (left, right)
 }
 
 /// Schließen-Knopf rechts in einer Tab-Zeile.
@@ -595,6 +674,8 @@ pub struct Ui {
     pub suggestions: Vec<Suggestion>,
     /// Ausgewählter Vorschlag (Pfeiltasten).
     pub selected: usize,
+    /// Tab, der gerade gezogen wird.
+    pub dragging: Option<usize>,
     tabs_label: Label,
     tab_labels: Vec<TabLabels>,
     new_tab_icon: Label,
@@ -642,6 +723,13 @@ pub struct TabsView<'a> {
     pub is_favorite: bool,
 }
 
+fn paired(layout: &Layout, i: usize) -> Option<(usize, usize, Rect)> {
+    layout.rows.iter().find_map(|(row, r)| match *row {
+        Row::Pair(a, b) if a == i || b == i => Some((a, b, *r)),
+        _ => None,
+    })
+}
+
 impl Ui {
     pub fn new(fs: &mut FontSystem) -> Self {
         let ui_family = ["Segoe UI Variable Text", "Segoe UI", "Noto Sans", "DejaVu Sans"]
@@ -673,6 +761,7 @@ impl Ui {
             sug_labels: Vec::new(),
             suggestions: Vec::new(),
             selected: 0,
+            dragging: None,
             tabs_label: Label::new(fs),
             tab_labels: Vec::new(),
             new_tab_icon: Label::new(fs),
@@ -892,14 +981,29 @@ impl Ui {
             self.tab_labels.push(TabLabels { icon: Label::new(fs), title: Label::new(fs), close: Label::new(fs) });
         }
         self.tab_labels.truncate(tabs.tabs.len().max(1));
+        // Verbundene Einträge (geteilte Ansicht): eine gemeinsame Karte mit Trennstrich.
+        for (row, r) in &layout.rows {
+            let Row::Pair(a, b) = *row else { continue };
+            let has_active = a == tabs.active || b == tabs.active;
+            cards.push(RoundRect::new(r.x, r.y, r.w, r.h, if has_active { t.surface } else { lerp(t.bg, t.surface, 0.7) }, 9.0 * s));
+            cards.push(RoundRect::outline(r.x, r.y, r.w, r.h, t.accent.with_alpha(if has_active { 140 } else { 60 }), 9.0 * s, 1.0 * s));
+            let mid = layout.tabs[b].x;
+            under.push(Quad { x: mid - 0.5 * s, y: r.y + 8.0 * s, w: (1.0 * s).max(1.0), h: r.h - 16.0 * s, color: t.dim.with_alpha(90) });
+        }
         for (i, state) in tabs.tabs.iter().enumerate() {
             let r = layout.tabs[i];
             let a = self.anim(Hit::Tab(i));
+            let in_pair = paired(layout, i).is_some();
             let bg = if i == tabs.active { t.active } else { lerp(t.bg, t.hover, a * 0.8) };
             if i == tabs.active || a > 0.0 {
-                cards.push(RoundRect::new(r.x, r.y, r.w, r.h, bg, 9.0 * s));
+                // In einem Paar: nur eine etwas kleinere Fläche innerhalb der gemeinsamen Karte.
+                let inset = if in_pair { 3.0 * s } else { 0.0 };
+                cards.push(RoundRect::new(r.x + inset, r.y + inset, r.w - 2.0 * inset, r.h - 2.0 * inset, bg, 7.0 * s));
             }
-            if self.hovered(Hit::Tab(i)) || i == tabs.active {
+            if self.dragging == Some(i) {
+                cards.push(RoundRect::outline(r.x, r.y, r.w, r.h, t.accent, 9.0 * s, 1.5 * s));
+            }
+            if self.hovered(Hit::Tab(i)) || (i == tabs.active && !in_pair) {
                 let c = close_rect(r, s);
                 let ca = self.anim(Hit::TabClose(i));
                 if ca > 0.0 {
@@ -930,6 +1034,24 @@ impl Ui {
             let mode = if stats.bench { "  ·  Dauerlauf (F2)" } else { "" };
             let line = format!("Monitor {hz}{mode}\nUI {} fps  ·  Web {} fps", stats.ui_fps, stats.web_fps);
             self.fps_label.set(fs, &line, 11.5 * s, &self.ui_family, false);
+        }
+
+        // Griff der Trennlinie zwischen den Hälften.
+        if let Some(d) = layout.divider {
+            let a = self.anim(Hit::Divider).max(if self.pressed == Some(Hit::Divider) { 1.0 } else { 0.0 });
+            let (gw, gh) = (3.0 * s, 36.0 * s);
+            cards.push(RoundRect::new(
+                d.x + (d.w - gw) / 2.0,
+                d.y + (d.h - gh) / 2.0,
+                gw,
+                gh,
+                lerp(t.hover, t.accent, a),
+                gw / 2.0,
+            ));
+        }
+        if let Some(z) = layout.drop_zone {
+            cards.push(RoundRect::new(z.x, z.y, z.w, z.h, t.accent.with_alpha(40), 10.0 * s));
+            cards.push(RoundRect::outline(z.x, z.y, z.w, z.h, t.accent.with_alpha(200), 10.0 * s, 2.0 * s));
         }
 
         // Vorschläge schweben über Favoriten und Tabs.
@@ -1041,7 +1163,7 @@ impl Ui {
             if !state.loading {
                 text.push(left_icon(&labels.icon, r, t.dim));
             }
-            let show_close = self.hovered(Hit::Tab(i)) || i == tabs.active;
+            let show_close = self.hovered(Hit::Tab(i)) || (i == tabs.active && paired(layout, i).is_none());
             let title_right = if show_close { close_rect(r, s).x - 4.0 * s } else { r.x + r.w - 8.0 * s };
             text.push(TextBlock {
                 buffer: &labels.title.buffer,
@@ -1201,6 +1323,26 @@ mod tests {
         assert_eq!(l.hit(l.star.x + 3.0, l.star.y + 3.0, false), Hit::Star);
         assert!(same_site("https://www.a.de/x", "https://a.de/"));
         assert!(!same_site("https://a.de/", "vyre://neuer-tab"));
+    }
+
+    #[test]
+    fn geteilte_ansicht() {
+        let base = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 1.0, Counts { tabs: 3, ..Default::default() });
+        let l = base.with_split(&[Row::Single(0), Row::Pair(1, 2)], Some(0.5), None);
+        // Das Paar teilt sich eine Zeile.
+        assert_eq!(l.tabs[1].y, l.tabs[2].y);
+        assert!(l.tabs[2].x > l.tabs[1].x);
+        assert_eq!(l.hit(l.tabs[2].x + 10.0, l.tabs[2].y + 10.0, false), Hit::Tab(2));
+        // Die Hälften lassen genau den Spalt frei, und der Spalt ist die Trennlinie.
+        let (a, b) = l.panes.unwrap();
+        assert_eq!(a.x + a.w + GAP, b.x);
+        assert_eq!(b.x + b.w, l.content.x + l.content.w);
+        assert_eq!(l.hit(a.x + a.w + GAP / 2.0, 400.0, false), Hit::Divider);
+        // Ziehen auf die rechte Hälfte: Seite links, Ablage rechts.
+        let base = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 1.0, Counts { tabs: 2, ..Default::default() });
+        let d = base.with_split(&[], None, Some(true));
+        assert!(d.drop_zone.unwrap().x > d.page.x);
+        assert!(d.page.w < d.content.w);
     }
 
     #[test]

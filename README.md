@@ -58,6 +58,21 @@ Ecosia, Google). Ändern geht jederzeit über „ändern“ unter dem Suchfeld.
 `!e`, `!b`). Ein Bang ohne Suchbegriff öffnet die Startseite. Unbekannte Bangs gehen an
 DuckDuckGo, das tausende weitere kennt.
 
+## Geteilte Ansicht (Split View)
+
+- **Teilen**: einen Tab aus der Seitenleiste auf die linke oder rechte Hälfte der Seite ziehen.
+  Beim Ziehen rückt die Seite zur Seite und zeigt, wo der Tab landet.
+- **Trennlinie** zwischen den Hälften mit der Maus verschieben (20–80 %).
+- In der Seitenleiste werden geteilte Tabs **ein verbundener Eintrag** mit beiden Titeln.
+  Ein Klick in eine Hälfte (Seite oder Eintrag) macht sie zum aktiven Tab; Adressleiste,
+  Zurück und Tastenkürzel gelten für diese Hälfte.
+- **Lösen**: eine Hälfte (ihren Titel im verbundenen Eintrag) zurück in die Seitenleiste
+  ziehen. Schließt man eine Hälfte, wird die andere wieder ein normaler Tab.
+- Beliebig viele geteilte Ansichten gleichzeitig; zieht man einen Tab auf eine geteilte
+  Ansicht, ersetzt er die Hälfte auf dieser Seite.
+- Sind beide Hälften Servo-Seiten, lädt eine davon beim Teilen einmal neu (Servo zeichnet
+  sie in ein zweites Fenster). WebView2-Seiten laden nicht neu.
+
 ## Verlauf, Favoriten, Sitzung
 
 - **Vorschläge** beim Tippen in der Adressleiste: zuerst das, was Enter tut (Suche, !Bang

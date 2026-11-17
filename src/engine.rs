@@ -134,7 +134,11 @@ pub trait Engine {
     fn take_events(&mut self) -> Vec<EngineEvent>;
 
     fn tabs(&self) -> Vec<PageState>;
+    /// Die Tab-Liste in Zeilen: einzelne Tabs und Paare (geteilte Ansicht).
+    fn rows(&self) -> Vec<Row>;
     fn active(&self) -> usize;
+    /// Der zuvor aktive Tab, falls er noch offen ist.
+    fn previous(&self) -> Option<usize>;
     fn select(&mut self, index: usize);
     /// Öffnet einen neuen Tab hinter dem aktiven und wählt ihn aus.
     fn new_tab(&mut self, url: Url);
@@ -142,6 +146,13 @@ pub trait Engine {
     fn close_tab(&mut self, index: usize) -> bool;
     /// Wechselt den aktiven Tab von Hand zur anderen Engine und merkt sich das für die Seite.
     fn toggle_engine(&mut self);
+    /// Zeigt `other` neben `target` (rechts oder links davon).
+    fn split(&mut self, target: usize, other: usize, other_right: bool);
+    /// Löst den Tab aus seiner geteilten Ansicht.
+    fn unsplit(&mut self, index: usize);
+    /// Anteil der linken Hälfte, wenn der aktive Tab geteilt ist.
+    fn ratio(&self) -> Option<f32>;
+    fn set_ratio(&mut self, ratio: f32);
 
     fn load(&mut self, url: Url);
     fn reload(&self);
@@ -153,10 +164,12 @@ pub trait Engine {
     /// Position und Größe des Seitenbereichs im Hauptfenster (physische Pixel).
     fn set_bounds(&self, x: i32, y: i32, width: u32, height: u32);
     fn set_scale(&self, scale: f64);
-    /// Fenster, in das Servo zeichnet.
-    fn window_id(&self) -> WindowId;
-    /// Ereignisse des Servo-Fensters (Maus, Neuzeichnen, Größe).
-    fn handle_window_event(&self, event: &WindowEvent);
+    /// Gehört das Fenster zu Servo (Seitenfenster)?
+    fn owns_window(&self, id: WindowId) -> bool;
+    /// Linke Kante eines Servo-Fensters im Hauptfenster.
+    fn window_x(&self, id: WindowId) -> Option<i32>;
+    /// Ereignisse eines Servo-Fensters (Maus, Neuzeichnen, Größe).
+    fn handle_window_event(&mut self, id: WindowId, event: &WindowEvent);
     /// Tastatur (kommt bei Servo-Tabs über das Hauptfenster, das den Fokus behält).
     fn handle_key(&self, event: &KeyEvent, modifiers: ModifiersState);
     /// Mausrad mit Position im Seitenbereich.
@@ -196,10 +209,16 @@ struct SwitchRequest {
 }
 
 /// Gemeinsamer Zustand aller Servo-Tabs, auf den Servos Meldungen zugreifen.
-struct Shared {
-    child: Arc<Window>,
-    main: Arc<Window>,
+/// Ein Kind-Fenster mit OpenGL-Kontext, in das Servo zeichnet.
+struct Surface {
+    window: Arc<Window>,
     context: Rc<WindowRenderingContext>,
+}
+
+struct Shared {
+    /// [0] für normale Tabs, [1] für die zweite Hälfte einer geteilten Ansicht.
+    surfaces: Vec<Surface>,
+    main: Arc<Window>,
     blocker: Arc<Blocker>,
     history: Arc<Store>,
     sites: Rc<RefCell<Sites>>,
@@ -235,15 +254,18 @@ struct Delegate {
     js_errors: Cell<u32>,
     /// Wann die Seite auf Scheitern geprüft wird.
     probe_at: Cell<Option<Instant>>,
+    /// In welches Servo-Fenster der Tab zeichnet.
+    surface: Cell<usize>,
 }
 
 impl Delegate {
-    fn new(shared: &Rc<Shared>, url: Option<Url>) -> Rc<Self> {
+    fn new(shared: &Rc<Shared>, url: Option<Url>, surface: usize) -> Rc<Self> {
         Rc::new(Self {
             state: RefCell::new(PageState { url, loading: true, ..Default::default() }),
             shared: shared.clone(),
             js_errors: Cell::new(0),
             probe_at: Cell::new(None),
+            surface: Cell::new(surface),
         })
     }
 
@@ -259,7 +281,7 @@ impl Delegate {
 
 impl WebViewDelegate for Delegate {
     fn notify_new_frame_ready(&self, _webview: WebView) {
-        self.shared.child.request_redraw();
+        self.shared.surfaces[self.surface.get()].window.request_redraw();
     }
 
     fn request_navigation(&self, webview: WebView, request: NavigationRequest) {
@@ -358,21 +380,23 @@ impl WebViewDelegate for Delegate {
         if !webview.focused() {
             return; // Tab im Hintergrund
         }
+        let window = &self.shared.surfaces[self.surface.get()].window;
         match cursor_icon(cursor) {
             Some(icon) => {
-                self.shared.child.set_cursor_visible(true);
-                self.shared.child.set_cursor(icon);
+                window.set_cursor_visible(true);
+                window.set_cursor(icon);
             }
-            None => self.shared.child.set_cursor_visible(false),
+            None => window.set_cursor_visible(false),
         }
     }
 
     fn request_create_new(&self, _parent: WebView, request: CreateNewWebViewRequest) {
         let shared = &self.shared;
-        let delegate = Delegate::new(shared, None);
+        let delegate = Delegate::new(shared, None, 0);
+        let surface = &shared.surfaces[0];
         let webview = request
-            .builder(shared.context.clone())
-            .hidpi_scale_factor(Scale::new(shared.child.scale_factor() as f32))
+            .builder(surface.context.clone())
+            .hidpi_scale_factor(Scale::new(surface.window.scale_factor() as f32))
             .delegate(delegate.clone())
             .build();
         shared.opened.borrow_mut().push((webview, delegate));
@@ -424,21 +448,73 @@ impl Tab {
             Backend::Edge(_) => None,
         }
     }
+
+    /// In welches Servo-Fenster der Tab zeichnet (`None` bei WebView2).
+    fn surface(&self) -> Option<usize> {
+        match &self.backend {
+            Backend::Servo { delegate, .. } => Some(delegate.surface.get()),
+            Backend::Edge(_) => None,
+        }
+    }
 }
+
+/// Zwei Tabs nebeneinander.
+#[derive(Clone, Copy, Debug)]
+struct Pair {
+    left: u64,
+    right: u64,
+    /// Anteil der linken Hälfte an der Breite (0..1).
+    ratio: f32,
+}
+
+/// Eine Zeile der Tab-Liste: ein Tab oder ein Paar (Indizes in die Tab-Liste).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Row {
+    Single(usize),
+    Pair(usize, usize),
+}
+
+type Bounds = (i32, i32, u32, u32);
 
 /// Servo und WebView2 als Engines, eine Engine pro Tab.
 pub struct ServoEngine {
     // Reihenfolge = Drop-Reihenfolge: zuerst die Tabs, dann Servo, dann Fenster und Kontext.
     tabs: Vec<Tab>,
     active: usize,
+    /// Der zuvor aktive Tab (für das Teilen mit dem gerade sichtbaren Tab).
+    previous: Option<u64>,
     next_id: u64,
+    pairs: Vec<Pair>,
     edge: EdgeRuntime,
     servo: Servo,
     shared: Rc<Shared>,
-    bounds: Cell<(i32, i32, u32, u32)>,
-    pointer: Cell<DevicePoint>,
+    /// Seitenbereich im Hauptfenster; bei geteilter Ansicht wird er aufgeteilt.
+    bounds: Cell<Bounds>,
+    pointer: Vec<Cell<DevicePoint>>,
     fps: RefCell<FpsCounter>,
     events: Vec<EngineEvent>,
+}
+
+/// Erstellt ein Kind-Fenster mit OpenGL-Kontext, in das Servo zeichnet.
+fn create_surface(event_loop: &ActiveEventLoop, main: &Window, bounds: Bounds, visible: bool) -> Result<Surface, String> {
+    let (x, y, w, h) = bounds;
+    let parent = main.window_handle().map_err(|e| e.to_string())?.as_raw();
+    let attrs = Window::default_attributes()
+        .with_title("Vyre Seite")
+        .with_decorations(false)
+        .with_visible(visible)
+        .with_position(PhysicalPosition::new(x, y))
+        .with_inner_size(PhysicalSize::new(w.max(1), h.max(1)));
+    // SAFETY: Das Hauptfenster lebt länger als das Kind-Fenster (es wird zuletzt freigegeben).
+    let attrs = unsafe { attrs.with_parent_window(Some(parent)) };
+    let window = Arc::new(event_loop.create_window(attrs).map_err(|e| e.to_string())?);
+    let display = event_loop.display_handle().map_err(|e| e.to_string())?;
+    let handle = window.window_handle().map_err(|e| e.to_string())?;
+    let context = Rc::new(
+        WindowRenderingContext::new(display, handle, window.inner_size())
+            .map_err(|e| format!("OpenGL-Kontext für Servo: {e:?}"))?,
+    );
+    Ok(Surface { window, context })
 }
 
 impl ServoEngine {
@@ -447,30 +523,17 @@ impl ServoEngine {
         event_loop: &ActiveEventLoop,
         main: Arc<Window>,
         proxy: EventLoopProxy<UserEvent>,
-        bounds: (i32, i32, u32, u32),
+        bounds: Bounds,
         url: Url,
         blocker: Arc<Blocker>,
         protocols: ProtocolRegistry,
         history: Arc<Store>,
     ) -> Result<Self, String> {
-        let (x, y, w, h) = bounds;
-        let parent = main.window_handle().map_err(|e| e.to_string())?.as_raw();
-        let attrs = Window::default_attributes()
-            .with_title("Vyre Seite")
-            .with_decorations(false)
-            .with_position(PhysicalPosition::new(x, y))
-            .with_inner_size(PhysicalSize::new(w.max(1), h.max(1)));
-        // SAFETY: Das Hauptfenster lebt länger als das Kind-Fenster (es wird zuletzt freigegeben).
-        let attrs = unsafe { attrs.with_parent_window(Some(parent)) };
-        let child = Arc::new(event_loop.create_window(attrs).map_err(|e| e.to_string())?);
-
-        let display = event_loop.display_handle().map_err(|e| e.to_string())?;
-        let handle = child.window_handle().map_err(|e| e.to_string())?;
-        let context = Rc::new(
-            WindowRenderingContext::new(display, handle, child.inner_size())
-                .map_err(|e| format!("OpenGL-Kontext für Servo: {e:?}"))?,
-        );
-        let _ = context.make_current();
+        // Zwei Servo-Fenster: eines für normale Tabs, das zweite für die zweite Hälfte einer
+        // geteilten Ansicht, wenn beide Hälften Servo-Seiten sind.
+        let first = create_surface(event_loop, &main, bounds, true)?;
+        let second = create_surface(event_loop, &main, bounds, false)?;
+        let _ = first.context.make_current();
 
         let profile = profile_dir();
         if let Err(e) = std::fs::create_dir_all(&profile) {
@@ -499,9 +562,8 @@ impl ServoEngine {
             vyre_dir.join("WebView2"),
         );
         let shared = Rc::new(Shared {
-            child,
+            surfaces: vec![first, second],
             main,
-            context,
             blocker,
             history,
             sites: Rc::new(RefCell::new(Sites::load(&sites::path()))),
@@ -513,12 +575,14 @@ impl ServoEngine {
         let mut engine = Self {
             tabs: Vec::new(),
             active: 0,
+            previous: None,
             next_id: 1,
+            pairs: Vec::new(),
             edge,
             servo,
             shared,
             bounds: Cell::new(bounds),
-            pointer: Cell::new(DevicePoint::new(0.0, 0.0)),
+            pointer: vec![Cell::new(DevicePoint::new(0.0, 0.0)), Cell::new(DevicePoint::new(0.0, 0.0))],
             fps: RefCell::new(FpsCounter::default()),
             events: Vec::new(),
         };
@@ -530,21 +594,36 @@ impl ServoEngine {
         self.tabs.get(self.active)
     }
 
-    fn send(&self, event: InputEvent) {
-        if let Some(webview) = self.tab().and_then(Tab::servo) {
+    /// Setzt den aktiven Tab und merkt sich den bisherigen.
+    fn set_active(&mut self, index: usize) {
+        if let Some(old) = self.tab().map(|t| t.id) {
+            if self.tabs.get(index).map(|t| t.id) != Some(old) {
+                self.previous = Some(old);
+            }
+        }
+        self.active = index;
+    }
+
+    fn index_of(&self, id: u64) -> Option<usize> {
+        self.tabs.iter().position(|t| t.id == id)
+    }
+
+    fn pair_of(&self, id: u64) -> Option<usize> {
+        self.pairs.iter().position(|p| p.left == id || p.right == id)
+    }
+
+    fn send_to(&self, index: usize, event: InputEvent) {
+        if let Some(webview) = self.tabs.get(index).and_then(Tab::servo) {
             webview.notify_input_event(event);
         }
     }
 
-    fn point(&self) -> WebViewPoint {
-        WebViewPoint::Device(self.pointer.get())
-    }
-
-    fn servo_backend(&self, url: Url) -> Backend {
-        let delegate = Delegate::new(&self.shared, Some(url.clone()));
-        let webview = WebViewBuilder::new(&self.servo, self.shared.context.clone())
+    fn servo_backend(&self, url: Url, surface: usize) -> Backend {
+        let delegate = Delegate::new(&self.shared, Some(url.clone()), surface);
+        let s = &self.shared.surfaces[surface];
+        let webview = WebViewBuilder::new(&self.servo, s.context.clone())
             .url(url)
-            .hidpi_scale_factor(Scale::new(self.shared.child.scale_factor() as f32))
+            .hidpi_scale_factor(Scale::new(s.window.scale_factor() as f32))
             .delegate(delegate.clone())
             .build();
         Backend::Servo { webview, delegate }
@@ -557,52 +636,106 @@ impl ServoEngine {
     }
 
     /// Die passende Engine für eine Adresse; Servo, wenn WebView2 nicht verfügbar ist.
-    fn backend_for(&self, id: u64, url: Url, visible: bool) -> Backend {
+    fn backend_for(&self, id: u64, url: Url, visible: bool, surface: usize) -> Backend {
         let choice = self.shared.sites.borrow().choice(&url);
         if choice == Choice::Edge && !self.edge.failed() {
             log::info!("{url} läuft mit WebView2");
             self.edge_backend(id, url, visible)
         } else {
-            self.servo_backend(url)
+            self.servo_backend(url, surface)
         }
     }
 
-    /// Ersetzt die Engine eines Tabs und lädt dort `url`.
+    /// Ersetzt die Engine eines Tabs (die alte wird freigegeben).
     fn replace_backend(&mut self, index: usize, backend: Backend) {
         if let Some(tab) = self.tabs.get_mut(index) {
-            // Die alte Engine wird hier freigegeben (WebView2-Fenster geschlossen bzw. Servo-WebView).
             tab.backend = backend;
         }
         self.show_active();
     }
 
-    /// Zeigt nur den aktiven Tab; das Servo-Fenster nur, wenn ein Servo-Tab aktiv ist.
-    fn show_active(&self) {
-        let mut servo_active = false;
-        for (i, t) in self.tabs.iter().enumerate() {
-            let active = i == self.active;
-            match &t.backend {
-                Backend::Servo { webview, .. } => {
-                    if active {
-                        webview.show();
-                        servo_active = true;
-                    } else {
-                        webview.hide();
-                        webview.set_focused(false);
-                    }
-                }
-                Backend::Edge(e) => e.set_visible(active),
+    /// Welche Tabs gerade zu sehen sind und wo: ein Tab oder ein Paar.
+    fn view(&self) -> Vec<(usize, Bounds)> {
+        let content = self.bounds.get();
+        let Some(tab) = self.tab() else { return Vec::new() };
+        if let Some(p) = self.pair_of(tab.id).map(|i| self.pairs[i]) {
+            if let (Some(l), Some(r)) = (self.index_of(p.left), self.index_of(p.right)) {
+                let scale = self.shared.main.scale_factor() as f32;
+                let (a, b) = split_bounds(content, p.ratio, scale);
+                return vec![(l, a), (r, b)];
             }
         }
-        self.shared.child.set_visible(servo_active);
-        self.shared.child.request_redraw();
+        vec![(self.active, content)]
+    }
+
+    /// Zwei sichtbare Servo-Tabs brauchen verschiedene Fenster; sonst lädt einer im anderen neu.
+    fn separate_surfaces(&mut self) {
+        let view = self.view();
+        let [(a, _), (b, _)] = view[..] else { return };
+        let (Some(sa), Some(sb)) = (self.tabs[a].surface(), self.tabs[b].surface()) else { return };
+        if sa != sb {
+            return;
+        }
+        // Die rechte (bzw. nicht aktive) Seite zieht um und lädt dabei einmal neu.
+        let mover = if b == self.active { a } else { b };
+        let Some(url) = self.tabs[mover].state().url else { return };
+        log::info!("{url} lädt für die geteilte Ansicht im zweiten Servo-Fenster neu");
+        self.tabs[mover].backend = self.servo_backend(url, 1 - sa);
+    }
+
+    /// Zeigt den aktiven Tab (bzw. das aktive Paar) an der richtigen Stelle, alles andere nicht.
+    fn show_active(&mut self) {
+        self.separate_surfaces();
+        self.apply_view();
+    }
+
+    fn apply_view(&self) {
+        let view = self.view();
+        let mut surface_used = [false, false];
+        for (i, t) in self.tabs.iter().enumerate() {
+            let place = view.iter().find(|(v, _)| *v == i).map(|(_, b)| *b);
+            match (&t.backend, place) {
+                (Backend::Servo { webview, delegate }, Some(bounds)) => {
+                    let s = delegate.surface.get();
+                    surface_used[s] = true;
+                    let surface = &self.shared.surfaces[s];
+                    place_window(&surface.window, bounds);
+                    if surface.window.inner_size() != PhysicalSize::new(bounds.2.max(1), bounds.3.max(1)) {
+                        webview.resize(PhysicalSize::new(bounds.2.max(1), bounds.3.max(1)));
+                    }
+                    webview.show();
+                    surface.window.request_redraw();
+                }
+                (Backend::Servo { webview, .. }, None) => {
+                    webview.hide();
+                    webview.set_focused(false);
+                }
+                (Backend::Edge(e), Some(bounds)) => {
+                    e.set_bounds(bounds);
+                    e.set_visible(true);
+                }
+                (Backend::Edge(e), None) => e.set_visible(false),
+            }
+        }
+        for (s, used) in surface_used.iter().enumerate() {
+            self.shared.surfaces[s].window.set_visible(*used);
+        }
         self.shared.main.request_redraw();
     }
 
     fn insert(&mut self, tab: Tab) {
         let at = (self.active + 1).min(self.tabs.len());
+        // Nicht mitten in ein Paar einfügen.
+        let at = match (self.tabs.get(at.wrapping_sub(1)), self.tabs.get(at)) {
+            (Some(prev), Some(next)) if self.pairs.iter().any(|p| p.left == prev.id && p.right == next.id) => at + 1,
+            _ => at,
+        };
+        let old = self.tab().map(|t| t.id);
         self.tabs.insert(at, tab);
         self.active = at;
+        if old.is_some() {
+            self.previous = old;
+        }
         self.show_active();
     }
 
@@ -660,11 +793,51 @@ impl ServoEngine {
                 self.shared.sites.borrow_mut().learn_edge(&r.url);
             }
             let id = self.tabs[i].id;
-            let backend = self.edge_backend(id, r.url, i == self.active);
+            let visible = self.view().iter().any(|(v, _)| *v == i);
+            let backend = self.edge_backend(id, r.url, visible);
             self.replace_backend(i, backend);
             changed = true;
         }
         changed
+    }
+
+    /// Welches Servo-Fenster gehört zu dieser Fenster-ID?
+    fn surface_by_window(&self, id: WindowId) -> Option<usize> {
+        self.shared.surfaces.iter().position(|s| s.window.id() == id)
+    }
+
+    /// Der sichtbare Tab in einem Servo-Fenster.
+    fn tab_on_surface(&self, surface: usize) -> Option<usize> {
+        self.view().into_iter().map(|(i, _)| i).find(|i| self.tabs[*i].surface() == Some(surface))
+    }
+
+    /// Ein Tab einer sichtbaren geteilten Ansicht bekommt den Fokus (Klick hinein).
+    fn activate_visible(&mut self, index: usize) {
+        if index != self.active && self.view().iter().any(|(i, _)| *i == index) {
+            self.set_active(index);
+            self.shared.main.request_redraw();
+        }
+    }
+}
+
+/// Teilt den Seitenbereich in zwei Hälften mit einem Spalt dazwischen.
+fn split_bounds((x, y, w, h): Bounds, ratio: f32, scale: f32) -> (Bounds, Bounds) {
+    let r = crate::ui::split_rects(
+        crate::ui::Rect { x: x as f32, y: y as f32, w: w as f32, h: h as f32 },
+        ratio,
+        scale,
+    );
+    let b = |r: crate::ui::Rect| (r.x.round() as i32, r.y.round() as i32, r.w.round() as u32, r.h.round() as u32);
+    (b(r.0), b(r.1))
+}
+
+fn place_window(window: &Window, (x, y, w, h): Bounds) {
+    if window.outer_position().ok() != Some(PhysicalPosition::new(x, y)) {
+        window.set_outer_position(PhysicalPosition::new(x, y));
+    }
+    let size = PhysicalSize::new(w.max(1), h.max(1));
+    if window.inner_size() != size {
+        let _ = window.request_inner_size(size);
     }
 }
 
@@ -695,12 +868,18 @@ impl Engine for ServoEngine {
         }
 
         let edge_events: Vec<(u64, EdgeEvent)> = self.edge.shared.events.borrow_mut().drain(..).collect();
-        let active_id = self.tab().map(|t| t.id);
         for (id, e) in edge_events {
             match e {
                 EdgeEvent::Shortcut(key, mods) => self.events.push(EngineEvent::Shortcut(key, mods)),
-                EdgeEvent::Focused if Some(id) == active_id => self.events.push(EngineEvent::PageFocused),
-                EdgeEvent::Focused => {}
+                EdgeEvent::Focused => {
+                    // Klick in eine WebView2-Hälfte einer geteilten Ansicht: sie wird aktiv.
+                    if let Some(i) = self.index_of(id) {
+                        self.activate_visible(i);
+                        if i == self.active {
+                            self.events.push(EngineEvent::PageFocused);
+                        }
+                    }
+                }
                 EdgeEvent::OpenTab(u) => {
                     if let Ok(url) = Url::parse(&u) {
                         self.events.push(EngineEvent::OpenTab(url));
@@ -719,26 +898,53 @@ impl Engine for ServoEngine {
         self.tabs.iter().map(Tab::state).collect()
     }
 
+    fn rows(&self) -> Vec<Row> {
+        let mut rows = Vec::new();
+        let mut i = 0;
+        while i < self.tabs.len() {
+            let id = self.tabs[i].id;
+            let next = self.tabs.get(i + 1).map(|t| t.id);
+            if next.is_some_and(|n| self.pairs.iter().any(|p| p.left == id && p.right == n)) {
+                rows.push(Row::Pair(i, i + 1));
+                i += 2;
+            } else {
+                rows.push(Row::Single(i));
+                i += 1;
+            }
+        }
+        rows
+    }
+
     fn active(&self) -> usize {
         self.active
     }
 
+    fn previous(&self) -> Option<usize> {
+        self.previous.and_then(|id| self.index_of(id))
+    }
+
     fn select(&mut self, index: usize) {
         if index < self.tabs.len() && index != self.active {
-            self.active = index;
+            self.set_active(index);
             self.show_active();
         }
     }
 
     fn new_tab(&mut self, url: Url) {
         let id = self.new_id();
-        let backend = self.backend_for(id, url, true);
+        let backend = self.backend_for(id, url, true, 0);
         self.insert(Tab { id, backend });
     }
 
     fn close_tab(&mut self, index: usize) -> bool {
         if index >= self.tabs.len() {
             return !self.tabs.is_empty();
+        }
+        let id = self.tabs[index].id;
+        // Schließt man eine Hälfte, wird die andere wieder ein normaler Tab.
+        self.pairs.retain(|p| p.left != id && p.right != id);
+        if self.previous == Some(id) {
+            self.previous = None;
         }
         self.tabs.remove(index);
         if self.tabs.is_empty() {
@@ -750,6 +956,49 @@ impl Engine for ServoEngine {
         }
         self.show_active();
         true
+    }
+
+    fn split(&mut self, target: usize, other: usize, other_right: bool) {
+        if target == other || target >= self.tabs.len() || other >= self.tabs.len() {
+            return;
+        }
+        let (target_id, other_id) = (self.tabs[target].id, self.tabs[other].id);
+        // Ziehen auf eine geteilte Ansicht ersetzt die Hälfte auf dieser Seite.
+        let mut ratio = 0.5;
+        if let Some(p) = self.pair_of(target_id) {
+            let pair = self.pairs.remove(p);
+            ratio = pair.ratio;
+            let keep = if other_right { pair.left } else { pair.right };
+            let replaced = if other_right { pair.right } else { pair.left };
+            if replaced == other_id {
+                // Die Hälfte wurde nur auf ihre eigene Seite gezogen.
+                self.pairs.push(pair);
+                return;
+            }
+            return self.split_ids(keep, other_id, other_right, ratio);
+        }
+        self.unsplit(other);
+        self.split_ids(target_id, other_id, other_right, ratio);
+    }
+
+    fn unsplit(&mut self, index: usize) {
+        let Some(id) = self.tabs.get(index).map(|t| t.id) else { return };
+        let Some(p) = self.pair_of(id) else { return };
+        self.pairs.remove(p);
+        self.show_active();
+    }
+
+    fn ratio(&self) -> Option<f32> {
+        let id = self.tab()?.id;
+        self.pair_of(id).map(|p| self.pairs[p].ratio)
+    }
+
+    fn set_ratio(&mut self, ratio: f32) {
+        let Some(id) = self.tab().map(|t| t.id) else { return };
+        if let Some(p) = self.pair_of(id) {
+            self.pairs[p].ratio = ratio.clamp(0.2, 0.8);
+            self.apply_view();
+        }
     }
 
     fn toggle_engine(&mut self) {
@@ -767,7 +1016,7 @@ impl Engine for ServoEngine {
         let id = tab.id;
         let backend = match to {
             Choice::Edge => self.edge_backend(id, url, true),
-            Choice::Servo => self.servo_backend(url),
+            Choice::Servo => self.servo_backend(url, 0),
         };
         self.replace_backend(self.active, backend);
     }
@@ -781,7 +1030,8 @@ impl Engine for ServoEngine {
             (Backend::Servo { webview, .. }, Choice::Edge) if self.edge.failed() => webview.load(url),
             _ => {
                 // Andere Engine nötig: Tab umbauen.
-                let backend = self.backend_for(tab.id, url, true);
+                let surface = tab.surface().unwrap_or(0);
+                let backend = self.backend_for(tab.id, url, true, surface);
                 self.replace_backend(self.active, backend);
             }
         }
@@ -828,23 +1078,8 @@ impl Engine for ServoEngine {
     }
 
     fn set_bounds(&self, x: i32, y: i32, width: u32, height: u32) {
-        self.bounds.set((x, y, width, height));
-        for t in &self.tabs {
-            if let Backend::Edge(e) = &t.backend {
-                e.set_bounds((x, y, width, height));
-            }
-        }
-        let child = &self.shared.child;
-        let size = PhysicalSize::new(width.max(1), height.max(1));
-        if child.outer_position().ok() != Some(PhysicalPosition::new(x, y)) {
-            child.set_outer_position(PhysicalPosition::new(x, y));
-        }
-        if child.inner_size() != size {
-            let _ = child.request_inner_size(size);
-            // Alle Servo-WebViews teilen sich den Kontext; eine Größenänderung gilt für alle.
-            if let Some(w) = self.tabs.iter().find_map(Tab::servo) {
-                w.resize(size);
-            }
+        if self.bounds.replace((x, y, width, height)) != (x, y, width, height) {
+            self.apply_view();
         }
     }
 
@@ -854,33 +1089,51 @@ impl Engine for ServoEngine {
         }
     }
 
-    fn window_id(&self) -> WindowId {
-        self.shared.child.id()
+    fn owns_window(&self, id: WindowId) -> bool {
+        self.surface_by_window(id).is_some()
     }
 
-    fn handle_window_event(&self, event: &WindowEvent) {
+    fn window_x(&self, id: WindowId) -> Option<i32> {
+        let s = self.surface_by_window(id)?;
+        self.shared.surfaces[s].window.outer_position().ok().map(|p| p.x)
+    }
+
+    fn handle_window_event(&mut self, id: WindowId, event: &WindowEvent) {
+        let Some(s) = self.surface_by_window(id) else { return };
+        let target = self.tab_on_surface(s);
         match event {
             WindowEvent::RedrawRequested => {
-                if let Some(webview) = self.tab().and_then(Tab::servo) {
-                    let _ = self.shared.context.make_current();
+                if let Some(webview) = target.and_then(|i| self.tabs[i].servo()) {
+                    let context = &self.shared.surfaces[s].context;
+                    let _ = context.make_current();
                     webview.paint();
-                    self.shared.context.present();
+                    context.present();
                     self.fps.borrow_mut().tick();
                 }
             }
             WindowEvent::Resized(size) => {
-                if let Some(w) = self.tabs.iter().find_map(Tab::servo) {
-                    w.resize(*size);
+                if let Some(webview) = target.and_then(|i| self.tabs[i].servo()) {
+                    webview.resize(*size);
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.pointer.set(DevicePoint::new(position.x as f32, position.y as f32));
-                self.send(InputEvent::MouseMove(MouseMoveEvent::new(self.point())));
+                self.pointer[s].set(DevicePoint::new(position.x as f32, position.y as f32));
+                if let Some(i) = target {
+                    let point = WebViewPoint::Device(self.pointer[s].get());
+                    self.send_to(i, InputEvent::MouseMove(MouseMoveEvent::new(point)));
+                }
             }
             WindowEvent::CursorLeft { .. } => {
-                self.send(InputEvent::MouseLeftViewport(MouseLeftViewportEvent::default()));
+                if let Some(i) = target {
+                    self.send_to(i, InputEvent::MouseLeftViewport(MouseLeftViewportEvent::default()));
+                }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                let Some(i) = target else { return };
+                if *state == ElementState::Pressed {
+                    // Klick in eine Hälfte einer geteilten Ansicht: sie wird aktiv.
+                    self.activate_visible(i);
+                }
                 let button = match button {
                     winit::event::MouseButton::Left => MouseButton::Primary,
                     winit::event::MouseButton::Right => MouseButton::Secondary,
@@ -893,32 +1146,59 @@ impl Engine for ServoEngine {
                     ElementState::Pressed => MouseButtonAction::Down,
                     ElementState::Released => MouseButtonAction::Up,
                 };
-                self.send(InputEvent::MouseButton(MouseButtonEvent::new(action, button, self.point())));
+                let point = WebViewPoint::Device(self.pointer[s].get());
+                self.send_to(i, InputEvent::MouseButton(MouseButtonEvent::new(action, button, point)));
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let p = self.pointer.get();
-                self.wheel(*delta, p.x as f64, p.y as f64);
+                let Some(i) = target else { return };
+                let p = self.pointer[s].get();
+                self.send_to(i, wheel_event(*delta, p.x as f64, p.y as f64));
             }
             _ => {}
         }
     }
 
     fn handle_key(&self, event: &KeyEvent, modifiers: ModifiersState) {
-        self.send(InputEvent::Keyboard(crate::keys::to_servo(event, modifiers)));
+        self.send_to(self.active, InputEvent::Keyboard(crate::keys::to_servo(event, modifiers)));
     }
 
     fn wheel(&self, delta: MouseScrollDelta, x: f64, y: f64) {
-        // Eine Zeile = 76 px wie in servoshell; Servo dreht das Vorzeichen selbst.
-        let (dx, dy, mode) = match delta {
-            MouseScrollDelta::LineDelta(dx, dy) => ((dx * 76.0) as f64, (dy * 76.0) as f64, WheelMode::DeltaLine),
-            MouseScrollDelta::PixelDelta(d) => (d.x, d.y, WheelMode::DeltaPixel),
-        };
-        let point = WebViewPoint::Device(DevicePoint::new(x as f32, y as f32));
-        self.send(InputEvent::Wheel(WheelEvent::new(WheelDelta { x: dx, y: dy, z: 0.0, mode }, point)));
+        self.send_to(self.active, wheel_event(delta, x, y));
     }
 
     fn fps(&self) -> usize {
         self.fps.borrow_mut().fps()
+    }
+}
+
+fn wheel_event(delta: MouseScrollDelta, x: f64, y: f64) -> InputEvent {
+    // Eine Zeile = 76 px wie in servoshell; Servo dreht das Vorzeichen selbst.
+    let (dx, dy, mode) = match delta {
+        MouseScrollDelta::LineDelta(dx, dy) => ((dx * 76.0) as f64, (dy * 76.0) as f64, WheelMode::DeltaLine),
+        MouseScrollDelta::PixelDelta(d) => (d.x, d.y, WheelMode::DeltaPixel),
+    };
+    let point = WebViewPoint::Device(DevicePoint::new(x as f32, y as f32));
+    InputEvent::Wheel(WheelEvent::new(WheelDelta { x: dx, y: dy, z: 0.0, mode }, point))
+}
+
+impl ServoEngine {
+    /// Bildet ein Paar aus zwei Tab-IDs; die Tabs rücken in der Liste nebeneinander.
+    fn split_ids(&mut self, keep: u64, other: u64, other_right: bool, ratio: f32) {
+        // `other` direkt neben `keep` stellen (links oder rechts davon).
+        let Some(oi) = self.index_of(other) else { return };
+        let tab = self.tabs.remove(oi);
+        let Some(ki) = self.index_of(keep) else {
+            self.tabs.insert(oi, tab);
+            return;
+        };
+        let at = if other_right { ki + 1 } else { ki };
+        self.tabs.insert(at, tab);
+        let (left, right) = if other_right { (keep, other) } else { (other, keep) };
+        self.pairs.push(Pair { left, right, ratio });
+        // Die gezogene Seite wird aktiv.
+        self.active = self.index_of(other).unwrap_or(0);
+        self.previous = Some(keep);
+        self.show_active();
     }
 }
 

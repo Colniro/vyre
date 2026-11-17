@@ -144,6 +144,10 @@ struct Browser {
     bench: bool,
     refresh_hz: Option<f32>,
     last_click: Option<(Instant, Hit)>,
+    /// Ein Tab wird (vielleicht) gezogen: Tab, Startpunkt, schon bewegt?
+    drag: Option<(usize, (f32, f32), bool)>,
+    /// Beim Ziehen auf die Seite: landet der Tab rechts (`true`) oder links?
+    drop_side: Option<bool>,
     last_draw: Instant,
     window: Arc<Window>,
 }
@@ -172,8 +176,8 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         let Some(b) = &mut self.browser else { return };
-        if id == b.engine.window_id() {
-            b.page_window_event(&event);
+        if b.engine.owns_window(id) {
+            b.page_window_event(id, &event);
         } else {
             b.main_window_event(event_loop, event);
         }
@@ -296,6 +300,8 @@ impl Browser {
             bench: false,
             refresh_hz,
             last_click: None,
+            drag: None,
+            drop_side: None,
             last_draw: Instant::now(),
             window,
         })
@@ -328,14 +334,17 @@ impl Browser {
         }
     }
 
-    fn page_window_event(&mut self, event: &WindowEvent) {
+    fn page_window_event(&mut self, id: WindowId, event: &WindowEvent) {
+        // Zuerst die Engine: ein Klick in eine Hälfte macht sie zum aktiven Tab.
+        self.engine.handle_window_event(id, event);
         match event {
             WindowEvent::MouseInput { state: ElementState::Pressed, .. } => self.focus_page(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.set_hover(Hit::Content);
                 // Ganz links in der Seite zählt wie der Rand: Seitenleiste ausfahren.
+                let left = self.engine.window_x(id).unwrap_or(0) as f64 + position.x;
                 if self.sidebar.mode == SidebarMode::Hover {
-                    if position.x < 3.0 * self.layout.scale as f64 {
+                    if left < self.layout.content.x as f64 + 3.0 * self.layout.scale as f64 {
                         self.sidebar.show();
                     } else {
                         self.sidebar.mouse_left();
@@ -345,7 +354,6 @@ impl Browser {
             }
             _ => {}
         }
-        self.engine.handle_window_event(event);
     }
 
     fn main_window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
@@ -379,8 +387,12 @@ impl Browser {
                     }
                     self.window.request_redraw();
                 }
+                self.drag_move();
                 self.window.set_cursor(match hit {
+                    _ if self.ui.dragging.is_some() => CursorIcon::Grabbing,
+                    _ if self.ui.pressed == Some(Hit::Divider) => CursorIcon::EwResize,
                     Hit::Resize(d) => resize_cursor(d),
+                    Hit::Divider => CursorIcon::EwResize,
                     Hit::UrlBar => CursorIcon::Text,
                     _ => CursorIcon::Default,
                 });
@@ -448,8 +460,9 @@ impl Browser {
                 favorites: self.favorites.len(),
                 suggestions: if self.ui.url_focused { self.ui.suggestions.len() } else { 0 },
             },
-        );
-        let (x, y, w, h) = to_bounds(self.layout.content);
+        )
+        .with_split(&self.engine.rows(), self.engine.ratio(), self.drop_side);
+        let (x, y, w, h) = to_bounds(self.layout.page);
         self.engine.set_bounds(x, y, w, h);
         self.window.request_redraw();
     }
@@ -681,8 +694,8 @@ impl Browser {
                 self.ui.pressed = Some(hit);
             }
             Hit::Tab(i) => {
-                // Tabs wechseln schon beim Drücken, das fühlt sich schneller an.
-                self.select_tab(i);
+                // Erst beim Loslassen wechseln: der Tab könnte auch gezogen werden.
+                self.drag = Some((i, self.cursor, false));
                 self.ui.pressed = Some(hit);
             }
             Hit::Nothing | Hit::Content | Hit::Edge => self.focus_page(),
@@ -691,9 +704,72 @@ impl Browser {
         self.window.request_redraw();
     }
 
+    /// Tab ziehen (auf die Seite = teilen, aus einem Paar in die Leiste = lösen) und Trennlinie.
+    fn drag_move(&mut self) {
+        if self.ui.pressed == Some(Hit::Divider) {
+            let c = self.layout.content;
+            if c.w > 0.0 {
+                self.engine.set_ratio((self.cursor.0 - c.x) / c.w);
+                self.relayout();
+            }
+            return;
+        }
+        let Some((tab, start, moved)) = self.drag else { return };
+        let threshold = 6.0 * self.layout.scale;
+        if !moved && (self.cursor.0 - start.0).hypot(self.cursor.1 - start.1) < threshold {
+            return;
+        }
+        self.drag = Some((tab, start, true));
+        self.ui.dragging = Some(tab);
+        let c = self.layout.content;
+        // Über der Seite: Vorschau, auf welcher Hälfte der Tab landet. Beim sichtbaren Tab selbst
+        // kommt der zuvor benutzte Tab in die andere Hälfte – ohne den geht es nicht.
+        let partner = if tab == self.engine.active() { self.engine.previous() } else { Some(self.engine.active()) };
+        let over_page = self.cursor.0 >= c.x && partner.is_some_and(|p| p != tab);
+        let side = over_page.then(|| self.cursor.0 > c.x + c.w / 2.0);
+        if side != self.drop_side {
+            self.drop_side = side;
+            self.relayout();
+        }
+        self.window.request_redraw();
+    }
+
+    /// Beendet ein Ziehen. `true`, wenn wirklich gezogen (nicht nur geklickt) wurde.
+    fn drag_end(&mut self) -> bool {
+        let Some((tab, _, moved)) = self.drag.take() else { return false };
+        self.ui.dragging = None;
+        let side = self.drop_side.take();
+        if !moved {
+            return false;
+        }
+        let rows = self.engine.rows();
+        let in_pair = rows.iter().any(|r| matches!(*r, engine::Row::Pair(a, b) if a == tab || b == tab));
+        if let Some(right) = side {
+            let target = if tab == self.engine.active() { self.engine.previous() } else { Some(self.engine.active()) };
+            if let Some(target) = target {
+                self.engine.split(target, tab, right);
+            }
+            self.focus_page();
+        } else if in_pair && self.layout.over_sidebar(self.cursor.0) {
+            // Hälfte zurück in die Leiste gezogen (nicht auf ihre eigene Zeile): Paar lösen.
+            let own_row = self.layout.rows.iter().find(|(r, _)| matches!(*r, engine::Row::Pair(a, b) if a == tab || b == tab));
+            if !own_row.is_some_and(|(_, rect)| rect.contains(self.cursor.0, self.cursor.1)) {
+                self.engine.unsplit(tab);
+            }
+        }
+        self.relayout();
+        true
+    }
+
     fn release(&mut self, event_loop: &ActiveEventLoop) {
         let pressed = self.ui.pressed.take();
         self.window.request_redraw();
+        if self.drag_end() {
+            return;
+        }
+        if pressed == Some(Hit::Divider) {
+            return;
+        }
         if pressed != Some(self.ui.hover) {
             return;
         }
@@ -708,6 +784,7 @@ impl Browser {
             Hit::TabClose(i) => self.close_tab(event_loop, i),
             Hit::NewTab => self.new_tab(),
             Hit::Shield => self.toggle_adblock(),
+            Hit::Tab(i) => self.select_tab(i),
             Hit::Star => self.toggle_favorite(),
             Hit::Favorite(i) => self.open_favorite(i),
             Hit::Suggestion(i) => self.open_suggestion(i),

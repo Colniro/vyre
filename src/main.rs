@@ -11,6 +11,7 @@ mod downloads;
 mod engine;
 mod history;
 mod importer;
+mod ipc;
 mod keys;
 mod newtab;
 mod privacy;
@@ -33,7 +34,7 @@ use render::{RoundRect, Scene};
 use ui::{Counts, FpsCounter, Hit, Layout, SidebarMode, Stats, Suggestion, SuggestionKind, TabsView, Ui};
 use url::Url;
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -49,6 +50,8 @@ pub enum UserEvent {
     Import(importer::Source),
     /// Ein Download hat Fortschritt gemacht oder ist fertig.
     DownloadsChanged,
+    /// Befehl über den Steuerkanal (`vyre open` …).
+    Ipc(ipc::Incoming),
     /// Pausieren/Fortsetzen/Abbrechen auf vyre://downloads (für WebView2-Downloads im Hauptthread).
     DownloadOp(u64, String),
 }
@@ -63,16 +66,31 @@ const SIDEBAR_TAU: f32 = 0.045;
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,vyre=info"))
         .init();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Steuerbefehle (`vyre open …`, `vyre tabs` …) gehen an das laufende Vyre.
+    if let Some(request) = ipc::parse_args(&args) {
+        std::process::exit(run_command(request));
+    }
+    let private = args.iter().any(|a| a == "--privat");
+    let beside = ipc::parse_args(&[vec!["open".to_string()], args.clone()].concat()).and_then(|r| match r {
+        ipc::Request::Open { beside, .. } => beside,
+        _ => None,
+    });
+    // Läuft schon ein Vyre: dort einen Tab öffnen statt ein zweites Fenster.
+    if !private && ipc::running() {
+        let url = args.iter().find(|a| !a.starts_with("--")).cloned();
+        if ipc::send(&ipc::Request::Open { url, beside }, |_| {}).is_ok() {
+            return;
+        }
+    }
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .expect("Ereignisschleife konnte nicht erstellt werden");
     // "--privat" öffnet ein privates Fenster; sonst Startadresse oder Suchbegriffe.
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let private = args.iter().any(|a| a == "--privat");
-    let start = args.into_iter().find(|a| !a.starts_with("--"));
-    let mut app = App { proxy: event_loop.create_proxy(), start, private, browser: None };
+    let start = args.iter().enumerate().find(|(i, a)| !a.starts_with("--") && (*i == 0 || args[i - 1] != "--neben")).map(|(_, a)| a.clone());
+    let mut app = App { proxy: event_loop.create_proxy(), start, private, beside, browser: None };
     event_loop.run_app(&mut app).expect("Ereignisschleife");
 }
 
@@ -80,6 +98,8 @@ struct App {
     proxy: EventLoopProxy<UserEvent>,
     start: Option<String>,
     private: bool,
+    /// Beim Start die rechte Hälfte dieser Fläche einnehmen (aus Wyven).
+    beside: Option<[i32; 4]>,
     browser: Option<Browser>,
 }
 
@@ -149,6 +169,8 @@ struct Browser {
     history: Arc<history::Store>,
     vault: Arc<vault::Vault>,
     downloads: downloads::Downloads,
+    /// Terminals, die `vyre konsole` laufen lassen.
+    console_subscribers: Vec<std::sync::mpsc::Sender<String>>,
     /// Abgeschicktes Login, das noch auf "Speichern?" wartet: Seite, Benutzername, Passwort.
     pending_save: Option<(String, String, String)>,
     /// Angepinnte Favoriten (Kopie aus der Datenbank, bei Änderungen neu gelesen).
@@ -178,7 +200,12 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         match Browser::new(event_loop, self.proxy.clone(), self.start.clone(), self.private) {
-            Ok(b) => self.browser = Some(b),
+            Ok(b) => {
+                if let Some(area) = self.beside {
+                    b.place_beside(area);
+                }
+                self.browser = Some(b);
+            }
             Err(e) => {
                 log::error!("Vyre konnte nicht starten: {e}");
                 event_loop.exit();
@@ -193,6 +220,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::BlockerReady => b.window.request_redraw(),
             UserEvent::Import(source) => b.run_import(source),
             UserEvent::DownloadsChanged => b.window.request_redraw(),
+            UserEvent::Ipc(incoming) => b.handle_ipc(incoming),
             UserEvent::DownloadOp(id, op) => b.engine.download_control(id, &op),
         }
     }
@@ -286,6 +314,14 @@ impl Browser {
         let t = Instant::now();
         let mut renderer = pollster::block_on(render::Renderer::new(window.clone(), event_loop.owned_display_handle()));
         log::info!("GPU bereit nach {:?}: {:?}", t.elapsed(), renderer.gpu_info());
+        if !private {
+            // Steuerkanal für `vyre …` und Wyven; Vyre in den PATH eintragen (einmalig).
+            let p = proxy.clone();
+            ipc::serve(move |incoming| {
+                let _ = p.send_event(UserEvent::Ipc(incoming));
+            });
+            std::thread::spawn(ipc::ensure_in_path);
+        }
         let mut ui = Ui::new(renderer.font_system());
         ui.set_private(private);
         let sidebar = Sidebar::new(settings.get().sidebar);
@@ -352,6 +388,7 @@ impl Browser {
             history,
             vault,
             downloads,
+            console_subscribers: Vec::new(),
             pending_save: None,
             saved_session: restore,
             keep_session,
@@ -388,6 +425,7 @@ impl Browser {
                     }
                 }
                 EngineEvent::Password { tab, page, message } => self.password_message(tab, &page, &message),
+                EngineEvent::Console { tab, level, text } => self.forward_console(tab, &level, &text),
                 EngineEvent::OpenTab(url) => {
                     self.engine.new_tab(url);
                     self.relayout();
@@ -678,6 +716,80 @@ impl Browser {
             self.relayout();
             self.focus_page();
         }
+    }
+
+    /// Befehl über den Steuerkanal (`vyre open`, `tabs`, `reload`, `konsole`).
+    fn handle_ipc(&mut self, incoming: ipc::Incoming) {
+        let reply = incoming.reply;
+        match incoming.request {
+            ipc::Request::Open { url, beside } => {
+                let engine = self.settings.get().search_engine.clone();
+                let url = url
+                    .and_then(|u| search::resolve_input(&u, engine.as_deref()))
+                    .unwrap_or_else(|| Url::parse(newtab::NEW_TAB_URL).expect("gültige URL"));
+                // Ist der aktive Tab leer (Neuer Tab), dort laden, sonst einen neuen öffnen.
+                let blank = self.engine.state().url.as_ref().is_none_or(|u| u.as_str() == newtab::NEW_TAB_URL);
+                if blank {
+                    self.engine.load(url.clone());
+                } else {
+                    self.engine.new_tab(url.clone());
+                }
+                self.relayout();
+                self.focus_page();
+                self.window.set_minimized(false);
+                self.window.focus_window();
+                if let Some(area) = beside {
+                    self.place_beside(area);
+                }
+                let _ = reply.send(format!("Geöffnet: {url}"));
+            }
+            ipc::Request::Tabs => {
+                let active = self.engine.active();
+                for (i, t) in self.engine.tabs().iter().enumerate() {
+                    let mark = if i == active { "*" } else { " " };
+                    // Lange Adressen (z. B. mit Login-Codes) kürzen, damit die Liste lesbar bleibt.
+                    let full = t.url.as_ref().map(|u| u.as_str()).unwrap_or("");
+                    let url = if full.chars().count() > 80 {
+                        format!("{}…", full.chars().take(79).collect::<String>())
+                    } else {
+                        full.to_string()
+                    };
+                    let state = if t.asleep { " (schläft)" } else { "" };
+                    let _ = reply.send(format!("{mark}{:>3}  {}{state}  {url}", i + 1, ui::tab_title(t)));
+                }
+            }
+            ipc::Request::Reload => {
+                self.engine.reload();
+                let _ = reply.send(format!("Neu geladen: {}", ui::tab_title(&self.engine.state())));
+            }
+            ipc::Request::Console => {
+                let _ = reply.send(format!("Konsole von „{}“ – Strg+C beendet", ui::tab_title(&self.engine.state())));
+                self.console_subscribers.push(reply);
+            }
+        }
+    }
+
+    /// Reicht Konsolenmeldungen der aktiven Seite an `vyre konsole` weiter (farbig).
+    fn forward_console(&mut self, tab: usize, level: &str, text: &str) {
+        if self.console_subscribers.is_empty() || tab != self.engine.active() {
+            return;
+        }
+        let color = match level {
+            "fehler" => "\x1b[31m",
+            "warnung" => "\x1b[33m",
+            "debug" => "\x1b[90m",
+            _ => "\x1b[0m",
+        };
+        let line = format!("{color}[{level}]\x1b[0m {text}");
+        self.console_subscribers.retain(|s| s.send(line.clone()).is_ok());
+    }
+
+    /// Nimmt die rechte Hälfte der Fläche ein (Wyven nimmt die linke).
+    fn place_beside(&self, [x, y, w, h]: [i32; 4]) {
+        self.window.set_maximized(false);
+        let half = w / 2;
+        self.window.set_outer_position(PhysicalPosition::new(x + half, y));
+        let _ = self.window.request_inner_size(PhysicalSize::new((w - half) as u32, h as u32));
     }
 
     /// Importiert Passwörter, Lesezeichen und Verlauf und zeigt das Ergebnis auf vyre://passwoerter.
@@ -1202,5 +1314,39 @@ fn open_private_window() {
             }
         }
         Err(e) => log::error!("Privates Fenster: {e}"),
+    }
+}
+
+/// Führt einen `vyre …`-Befehl im Terminal aus. Läuft kein Vyre, startet `vyre open` es.
+fn run_command(request: ipc::Request) -> i32 {
+    match ipc::send(&request, |line| println!("{line}")) {
+        Ok(()) => 0,
+        Err(_) => match request {
+            ipc::Request::Open { url, beside } => {
+                let Ok(exe) = std::env::current_exe() else { return 1 };
+                let mut cmd = std::process::Command::new(exe);
+                cmd.args(url);
+                if let Some([x, y, w, h]) = beside {
+                    cmd.arg("--neben").arg(format!("{x},{y},{w},{h}"));
+                }
+                // Vom Terminal lösen, damit Vyre weiterläuft, wenn es geschlossen wird.
+                use std::os::windows::process::CommandExt;
+                const DETACHED_PROCESS: u32 = 0x0000_0008;
+                match cmd.creation_flags(DETACHED_PROCESS).spawn() {
+                    Ok(_) => {
+                        println!("Vyre wird gestartet …");
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("Vyre konnte nicht gestartet werden: {e}");
+                        1
+                    }
+                }
+            }
+            _ => {
+                eprintln!("Vyre läuft nicht. Starte es mit `vyre open <adresse>`.");
+                1
+            }
+        },
     }
 }

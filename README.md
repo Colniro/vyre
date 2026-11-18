@@ -140,6 +140,26 @@ Die gelernten und festgelegten Seiten stehen in `%LOCALAPPDATA%\Vyre\engine-seit
   zusätzlich so, dass nur Chrome selbst sie lesen kann – die meldet der Import, dafür gibt es
   den CSV-Weg. Firefox/Zen mit Hauptpasswort: ebenfalls über CSV.
 
+## Zusammen mit Wyven und im Terminal
+
+Vyre trägt seinen Ordner beim ersten Start in deinen Benutzer-PATH ein. Danach geht in jedem
+neuen Terminal (auch in Wyven):
+
+| Befehl | Wirkung |
+|---|---|
+| `vyre open <adresse>` | Tab im laufenden Vyre öffnen (startet Vyre, falls nötig) |
+| `vyre tabs` | Offene Tabs auflisten (`*` = aktiv) |
+| `vyre reload` | Aktive Seite neu laden, z. B. nach dem Speichern |
+| `vyre konsole` | Konsole der aktiven Seite laufend anzeigen, farbig (Strg+C beendet) |
+
+Startet man Vyre ein zweites Mal mit einer Adresse, öffnet sie sich als Tab im laufenden Fenster.
+
+In **Wyven** werden Links im Terminal bei gedrückter Strg-Taste unterstrichen; **Strg+Klick**
+öffnet sie in Vyre. Wyven nimmt dann die linke, Vyre die rechte Bildschirmhälfte.
+
+Technik: Named Pipe `\\.\pipe\vyre`, eine JSON-Zeile pro Befehl. Die Konsole kommt bei Servo
+direkt, bei WebView2 über das DevTools-Protokoll.
+
 ## Privates Fenster
 
 Strg+Umschalt+N oder „Privates Fenster“ unter „+ Neuer Tab“ startet ein eigenes Vyre-Fenster
@@ -208,6 +228,7 @@ geladen. Das sind die einzigen Verbindungen, die Vyre von sich aus aufbaut.
 - `src/vault.rs`, `src/pwfill.rs`: Passwort-Tresor (DPAPI) und Ausfüllen in Seiten
 - `src/downloads.rs`: Downloads (eigener Downloader, WebView2-Anbindung, Übersicht)
 - `src/importer.rs`: Import aus Chrome/Edge/Brave, Firefox/Zen und CSV
+- `src/ipc.rs`: Steuerkanal (Named Pipe), `vyre`-Befehle, PATH-Eintrag
 - `src/settings.rs`: gespeicherte Einstellungen
 - `src/render/`: GPU-Zeichnen (aus Wyven übernommen)
 - `src/keys.rs`, `src/win.rs`: Tastenübersetzung, Windows-11-Fenstereffekte

@@ -144,6 +144,8 @@ pub enum EngineEvent {
     Shortcut(Key, ModifiersState),
     /// Die Seite hat den Tastaturfokus bekommen.
     PageFocused,
+    /// Meldung der Seitenkonsole (für `vyre konsole`): Stufe ("fehler", "warnung", "info", …) und Text.
+    Console { tab: usize, level: String, text: String },
     /// Nachricht des Passwort-Skripts einer Seite (`origin` = Adresse des Tabs, nicht der Seite).
     Password { tab: usize, page: String, message: String },
     /// Eine Seite will einen neuen Tab öffnen.
@@ -264,6 +266,8 @@ struct Shared {
     /// Nachrichten des Passwort-Skripts: WebView, Adresse der Seite, Nachricht.
     pw_messages: RefCell<Vec<(WebViewId, String, String)>>,
     downloads: Downloads,
+    /// Konsolenmeldungen aus Servo-Tabs: WebView, Stufe, Text.
+    console: RefCell<Vec<(WebViewId, String, String)>>,
     /// Downloads aus Servo-Tabs: Adresse, gewünschter Name, Seite (für Referer und Cookies).
     download_requests: RefCell<Vec<(Url, Option<String>, Option<Url>)>>,
     /// Tabs, die zu WebView2 wechseln sollen.
@@ -523,6 +527,13 @@ impl WebViewDelegate for Delegate {
         if matches!(level, ConsoleLogLevel::Error) {
             self.js_errors.set(self.js_errors.get() + 1);
         }
+        let stufe = match level {
+            ConsoleLogLevel::Error => "fehler",
+            ConsoleLogLevel::Warn => "warnung",
+            ConsoleLogLevel::Debug | ConsoleLogLevel::Trace => "debug",
+            _ => "info",
+        };
+        self.shared.console.borrow_mut().push((webview.id(), stufe.to_string(), message.clone()));
         // Später wird das an Wyven weitergereicht.
         log::info!(target: "vyre::console", "[{level:?}] {message}");
     }
@@ -725,6 +736,7 @@ impl ServoEngine {
             pending_css: RefCell::default(),
             pw_messages: RefCell::default(),
             downloads: downloads.clone(),
+            console: RefCell::default(),
             download_requests: RefCell::default(),
             switch: RefCell::default(),
             sleep_checks: Rc::default(),
@@ -1181,6 +1193,12 @@ impl Engine for ServoEngine {
         for (url, name, page) in requests {
             self.start_download(url, name, page);
         }
+        let console: Vec<(WebViewId, String, String)> = self.shared.console.borrow_mut().drain(..).collect();
+        for (wid, level, text) in console {
+            if let Some(tab) = self.tabs.iter().position(|t| t.servo().is_some_and(|w| w.id() == wid)) {
+                self.events.push(EngineEvent::Console { tab, level, text });
+            }
+        }
         let pw: Vec<(WebViewId, String, String)> = self.shared.pw_messages.borrow_mut().drain(..).collect();
         for (wid, page, message) in pw {
             if let Some(tab) = self.tabs.iter().position(|t| t.servo().is_some_and(|w| w.id() == wid)) {
@@ -1198,6 +1216,11 @@ impl Engine for ServoEngine {
                         if i == self.active {
                             self.events.push(EngineEvent::PageFocused);
                         }
+                    }
+                }
+                EdgeEvent::Console(level, text) => {
+                    if let Some(tab) = self.index_of(id) {
+                        self.events.push(EngineEvent::Console { tab, level, text });
                     }
                 }
                 EdgeEvent::Message(page, message) => {

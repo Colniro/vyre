@@ -49,6 +49,8 @@ pub enum EdgeEvent {
     NoHttps(String),
     /// Nachricht des Passwort-Skripts: Adresse der Seite, Nachricht.
     Message(String, String),
+    /// Meldung der Seitenkonsole: Stufe, Text.
+    Console(String, String),
 }
 
 /// Gemeinsamer Zustand aller Edge-Tabs.
@@ -388,6 +390,29 @@ fn setup(
                 &mut dl_token,
             )?;
         }
+        // Konsole der Seite über das DevTools-Protokoll mitlesen (für `vyre konsole`).
+        for event in ["Runtime.consoleAPICalled", "Runtime.exceptionThrown"] {
+            let receiver = webview.GetDevToolsProtocolEventReceiver(&HSTRING::from(event))?;
+            let sh = shared.clone();
+            let mut t = 0i64;
+            receiver.add_DevToolsProtocolEventReceived(
+                &DevToolsProtocolEventReceivedEventHandler::create(Box::new(move |_, args| {
+                    let Some(a) = args else { return Ok(()) };
+                    let json = read(|p| a.ParameterObjectAsJson(p));
+                    if let Some((level, text)) = console_from_devtools(&json) {
+                        sh.events.borrow_mut().push((id, EdgeEvent::Console(level, text)));
+                        sh.main.request_redraw();
+                    }
+                    Ok(())
+                })),
+                &mut t,
+            )?;
+        }
+        webview.CallDevToolsProtocolMethod(
+            &HSTRING::from("Runtime.enable"),
+            &HSTRING::from("{}"),
+            &CallDevToolsProtocolMethodCompletedHandler::create(Box::new(|_, _| Ok(()))),
+        )?;
         // Fingerprinting-Schutz vor den Skripten jeder Seite.
         webview.AddScriptToExecuteOnDocumentCreated(
             &HSTRING::from(crate::privacy::FINGERPRINT_SCRIPT),
@@ -619,6 +644,37 @@ fn setup(
         }
     }
     Ok(())
+}
+
+/// Macht aus einem DevTools-Ereignis (consoleAPICalled / exceptionThrown) Stufe und Text.
+fn console_from_devtools(json: &str) -> Option<(String, String)> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    if let Some(details) = v.get("exceptionDetails") {
+        let text = details
+            .get("exception")
+            .and_then(|e| e.get("description"))
+            .and_then(|d| d.as_str())
+            .or_else(|| details.get("text").and_then(|t| t.as_str()))
+            .unwrap_or("Fehler");
+        return Some(("fehler".into(), text.to_string()));
+    }
+    let level = match v.get("type")?.as_str()? {
+        "error" | "assert" => "fehler",
+        "warning" => "warnung",
+        "debug" | "trace" => "debug",
+        _ => "info",
+    };
+    let parts: Vec<String> = v
+        .get("args")?
+        .as_array()?
+        .iter()
+        .map(|a| match a.get("value") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(other) => other.to_string(),
+            None => a.get("description").and_then(|d| d.as_str()).unwrap_or("").to_string(),
+        })
+        .collect();
+    Some((level.into(), parts.join(" ")))
 }
 
 fn request_kind(ctx: COREWEBVIEW2_WEB_RESOURCE_CONTEXT) -> &'static str {

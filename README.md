@@ -51,7 +51,26 @@ Der erste Build dauert lange, weil Servo mitgebaut wird. SpiderMonkey wird ferti
 | Strg+Umschalt+E | Engine des Tabs wechseln (Servo ↔ WebView2) |
 | Strg+Umschalt+Z | Aktiven Tab schlafen legen |
 | Strg+H, Strg+Umschalt+Entf | Verlauf |
+| F12, Strg+Umschalt+I | Inspektor ein/aus |
+| Strg+Umschalt+C | Element-Picker des Inspektors |
 | ↑ / ↓ in der Adressleiste | Vorschlag wählen |
+
+## Inspektor
+
+F12 öffnet rechts eine Leiste für Webentwickler (die Seite wird schmaler, die Breite lässt sich
+am linken Rand ziehen). Sie funktioniert bei Servo- und WebView2-Tabs gleich:
+
+- **Element**: Zielkreuz (Strg+Umschalt+C), dann über die Seite fahren. Das Element wird wie
+  gewohnt farbig hervorgehoben (Außenabstand, Rahmen, Innenabstand, Inhalt); ein Klick hält es
+  fest. Die Leiste zeigt Selektor, Weg im Dokument, Box-Modell mit allen Werten, die wichtigsten
+  berechneten Stile (Farben mit Farbfeld) und Attribute wie `href` und `src`. Esc bricht ab.
+- **Konsole**: alle Meldungen der Seite, Fehler rot, Warnungen gelb. Unten lässt sich JavaScript
+  in der Seite ausführen (Enter), ↑/↓ holt frühere Eingaben zurück. Objekte, Listen und
+  Elemente werden kurz dargestellt, Promises nach dem Erfüllen.
+- **Netzwerk**: jede geladene Datei mit Art, Host, Status, Größe und Dauer (aus den Resource
+  Timings der Seite), dazu die vom Werbeblocker gestoppten Anfragen in Rot.
+
+Beim Laden einer neuen Seite beginnen Konsole und Netzwerk von vorn.
 
 ## Seitenleiste
 
@@ -252,6 +271,7 @@ die Vyre von sich aus aufbaut.
 - `src/importer.rs`: Import aus Chrome/Edge/Brave, Firefox/Zen und CSV
 - `src/ipc.rs`: Steuerkanal (Named Pipe), `vyre`-Befehle, PATH-Eintrag
 - `src/settings.rs`: gespeicherte Einstellungen
+- `src/inspector.rs`, `src/ui/panel.rs`: Inspektor (Skript in der Seite, Daten, Leiste)
 - `src/update.rs`: Update-Prüfung, Download mit Prüfsumme, Installer starten
 - `installer/vyre.iss`, `scripts/release.ps1`: Installer und Release
 - `src/render/`: GPU-Zeichnen (aus Wyven übernommen)

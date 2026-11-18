@@ -11,6 +11,7 @@ mod downloads;
 mod engine;
 mod history;
 mod importer;
+mod inspector;
 mod ipc;
 mod keys;
 mod newtab;
@@ -207,6 +208,12 @@ struct Browser {
     pending_save: Option<(String, String, String)>,
     /// Karte zum Update (Angebot, Laden, Ergebnis einer Prüfung von Hand).
     update_card: Option<UpdateCard>,
+    /// Inspektor rechts (F12).
+    insp: inspector::Inspector,
+    /// Skript des Inspektors in die Seite legen, sobald sie fertig geladen ist.
+    insp_inject: bool,
+    /// Lud die Seite beim letzten Zeichnen (um Neuladen zu erkennen)?
+    insp_loading: bool,
     /// `vyre update` wartet auf das Ergebnis.
     update_reply: Option<std::sync::mpsc::Sender<String>>,
     update_proxy: EventLoopProxy<UserEvent>,
@@ -437,6 +444,9 @@ impl Browser {
             console_subscribers: Vec::new(),
             pending_save: None,
             update_card: None,
+            insp: inspector::Inspector::default(),
+            insp_inject: false,
+            insp_loading: false,
             update_reply: None,
             update_proxy,
             saved_session: restore,
@@ -473,8 +483,19 @@ impl Browser {
                         self.relayout();
                     }
                 }
+                EngineEvent::Password { tab, message, .. } if message.starts_with(inspector::PREFIX) => {
+                    self.inspector_message(tab, &message);
+                }
                 EngineEvent::Password { tab, page, message } => self.password_message(tab, &page, &message),
-                EngineEvent::Console { tab, level, text } => self.forward_console(tab, &level, &text),
+                EngineEvent::Console { tab, level, text } => {
+                    self.forward_console(tab, &level, &text);
+                    if tab == self.engine.active() {
+                        self.insp.push_line(inspector::Level::from_name(&level), &text);
+                        if self.insp.open {
+                            self.window.request_redraw();
+                        }
+                    }
+                }
                 EngineEvent::OpenTab(url) => {
                     self.engine.new_tab(url);
                     self.relayout();
@@ -542,9 +563,17 @@ impl Browser {
                     _ if self.ui.pressed == Some(Hit::Divider) => CursorIcon::EwResize,
                     Hit::Resize(d) => resize_cursor(d),
                     Hit::Divider => CursorIcon::EwResize,
-                    Hit::UrlBar => CursorIcon::Text,
+                    Hit::UrlBar | Hit::InspInput => CursorIcon::Text,
+                    Hit::InspResize => CursorIcon::EwResize,
+                    _ if self.ui.pressed == Some(Hit::InspResize) => CursorIcon::EwResize,
                     _ => CursorIcon::Default,
                 });
+                // Text in der Konsolen-Eingabe mit gedrückter Maus markieren.
+                if self.ui.pressed == Some(Hit::InspInput) && self.insp.input_focused {
+                    let idx = self.ui.insp_input_index(self.cursor.0, &self.layout, &self.insp.input.text);
+                    self.insp.input.move_to(idx, true);
+                    self.window.request_redraw();
+                }
                 // Text in der Adressleiste mit gedrückter Maus markieren.
                 if self.ui.pressed == Some(Hit::UrlBar) && self.ui.url_focused {
                     self.ui.click_url(self.cursor.0, &self.layout, true);
@@ -577,6 +606,10 @@ impl Browser {
                 _ => {}
             },
             WindowEvent::MouseWheel { delta, .. } => {
+                if self.layout.insp.is_some_and(|p| p.panel.contains(self.cursor.0, self.cursor.1)) {
+                    self.inspector_scroll(delta);
+                    return;
+                }
                 let c = self.layout.content;
                 if c.contains(self.cursor.0, self.cursor.1) {
                     self.engine.wheel(delta, (self.cursor.0 - c.x) as f64, (self.cursor.1 - c.y) as f64);
@@ -611,6 +644,7 @@ impl Browser {
                 prompt: self.pending_save.is_some() || self.update_card.is_some(),
                 downloads: self.downloads.sidebar().len(),
                 private_button: !self.ui.private,
+                inspector: self.insp.open.then_some((self.insp.width, self.insp.tab == inspector::Tab::Console)),
             },
         )
         .with_split(&self.engine.rows(), self.engine.ratio(), self.drop_side);
@@ -636,6 +670,7 @@ impl Browser {
         self.ui.url.set(&text);
         self.ui.url.select_all();
         self.ui.url_focused = true;
+        self.insp.input_focused = false;
         self.engine.set_focused(false);
         // Aus einem WebView2-Tab den Tastaturfokus zurückholen.
         #[cfg(windows)]
@@ -644,6 +679,10 @@ impl Browser {
     }
 
     fn focus_page(&mut self) {
+        if self.insp.input_focused {
+            self.insp.input_focused = false;
+            self.window.request_redraw();
+        }
         if self.ui.url_focused {
             self.ui.url_focused = false;
             self.ui.suggestions.clear();
@@ -911,6 +950,160 @@ impl Browser {
         }
     }
 
+    /// F12: Inspektor öffnen oder schließen.
+    fn toggle_inspector(&mut self) {
+        self.insp.open = !self.insp.open;
+        let active = self.engine.active();
+        if self.insp.open {
+            self.insp_inject = true;
+        } else {
+            self.engine.eval_in(active, inspector::STOP_SCRIPT);
+            self.insp.picking = false;
+            self.insp.input_focused = false;
+        }
+        self.relayout();
+    }
+
+    /// Legt das Skript in die aktive Seite. Es meldet alle Anfragen seit dem Laden neu.
+    fn inspector_inject(&mut self) {
+        self.insp.requests.clear();
+        self.engine.eval_in(self.engine.active(), inspector::PAGE_SCRIPT);
+        self.insp_inject = false;
+    }
+
+    /// Zielkreuz: Element-Picker an oder aus.
+    fn toggle_pick(&mut self) {
+        if !self.insp.open {
+            return;
+        }
+        self.insp.picking = !self.insp.picking;
+        self.insp.tab = inspector::Tab::Element;
+        self.insp.input_focused = false;
+        if self.insp.picking && (self.insp_inject || !self.engine.state().loading) {
+            self.inspector_inject();
+        }
+        self.engine.eval_in(self.engine.active(), &inspector::pick_script(self.insp.picking));
+        self.relayout();
+    }
+
+    /// Nachricht des Inspektor-Skripts oder des Werbeblockers.
+    fn inspector_message(&mut self, tab: usize, message: &str) {
+        if tab != self.engine.active() {
+            return;
+        }
+        if let Some(m) = inspector::parse(message) {
+            let picking = self.insp.picking;
+            if self.insp.handle(m) && self.insp.open {
+                if picking != self.insp.picking {
+                    self.relayout();
+                }
+                self.window.request_redraw();
+            }
+        }
+    }
+
+    /// Neue Seite, anderer Tab oder neu geladen: Daten verwerfen, Skript neu einlegen.
+    fn inspector_sync(&mut self, active: usize, page: &engine::PageState) {
+        let url = page.url.as_ref().map(|u| {
+            let mut u = u.clone();
+            u.set_fragment(None);
+            u.to_string()
+        });
+        let key = Some((active, url.unwrap_or_default()));
+        let reloading = page.loading && !self.insp_loading;
+        if self.insp.page != key || reloading {
+            let tab_changed = self.insp.page.as_ref().map(|p| p.0) != Some(active);
+            // Die Blockier-Meldungen kommen schon beim Laden; beim Wechsel der Adresse in
+            // derselben Seite nicht verwerfen.
+            let blocked = std::mem::take(&mut self.insp.blocked);
+            self.insp.reset_page(key);
+            if !tab_changed && !reloading {
+                self.insp.blocked = blocked;
+            }
+            self.insp_inject = self.insp.open;
+        }
+        if self.insp.open && self.insp_inject && !page.loading && !page.asleep {
+            self.inspector_inject();
+        }
+        self.insp_loading = page.loading;
+    }
+
+    fn focus_inspector_input(&mut self) {
+        self.ui.url_focused = false;
+        self.ui.suggestions.clear();
+        self.insp.input_focused = true;
+        self.engine.set_focused(false);
+        #[cfg(windows)]
+        win::take_focus(&self.window);
+        self.relayout();
+    }
+
+    /// Mausrad über der Leiste.
+    fn inspector_scroll(&mut self, delta: winit::event::MouseScrollDelta) {
+        let dy = match delta {
+            winit::event::MouseScrollDelta::LineDelta(_, y) => y * 48.0 * self.layout.scale,
+            winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32,
+        };
+        let tab = self.insp.tab;
+        let (current, max) = self.ui.insp_scroll(tab);
+        let next = (current - dy).clamp(0.0, max);
+        self.insp.scroll[tab.index()] = next;
+        if tab == inspector::Tab::Console {
+            self.insp.stick_bottom = next >= max - 1.0;
+        }
+        self.window.request_redraw();
+    }
+
+    /// Tasten in der Konsolen-Eingabe.
+    fn inspector_key(&mut self, event: &KeyEvent) {
+        let ctrl = self.modifiers.control_key();
+        let alt = self.modifiers.alt_key();
+        let shift = self.modifiers.shift_key();
+        let field = &mut self.insp.input;
+        match &event.logical_key {
+            Key::Named(NamedKey::Enter) => {
+                if let Some(script) = self.insp.submit() {
+                    if self.insp_inject && !self.engine.state().loading {
+                        self.inspector_inject();
+                    }
+                    self.engine.eval_in(self.engine.active(), &script);
+                }
+            }
+            Key::Named(NamedKey::ArrowUp) => self.insp.history_step(true),
+            Key::Named(NamedKey::ArrowDown) => self.insp.history_step(false),
+            Key::Named(NamedKey::Escape) => self.focus_page(),
+            Key::Named(NamedKey::Backspace) => field.backspace(),
+            Key::Named(NamedKey::Delete) => field.delete(),
+            Key::Named(NamedKey::ArrowLeft) => field.left(shift),
+            Key::Named(NamedKey::ArrowRight) => field.right(shift),
+            Key::Named(NamedKey::Home) => field.move_to(0, shift),
+            Key::Named(NamedKey::End) => field.move_to(field.text.len(), shift),
+            Key::Character(c) if ctrl && c.eq_ignore_ascii_case("a") => field.select_all(),
+            Key::Character(c) if ctrl && (c.eq_ignore_ascii_case("c") || c.eq_ignore_ascii_case("x")) => {
+                if let Some(sel) = field.selected_text() {
+                    if let Ok(mut cb) = arboard::Clipboard::new() {
+                        let _ = cb.set_text(sel.to_string());
+                    }
+                    if c.eq_ignore_ascii_case("x") {
+                        field.backspace();
+                    }
+                }
+            }
+            Key::Character(c) if ctrl && c.eq_ignore_ascii_case("v") => {
+                if let Some(text) = arboard::Clipboard::new().ok().and_then(|mut cb| cb.get_text().ok()) {
+                    field.insert(&text.replace(['\r', '\n'], " "));
+                }
+            }
+            _ if !ctrl && !alt => {
+                if let Some(text) = &event.text {
+                    field.insert(text);
+                }
+            }
+            _ => {}
+        }
+        self.window.request_redraw();
+    }
+
     /// Reicht Konsolenmeldungen der aktiven Seite an `vyre konsole` weiter (farbig).
     fn forward_console(&mut self, tab: usize, level: &str, text: &str) {
         if self.console_subscribers.is_empty() || tab != self.engine.active() {
@@ -1108,6 +1301,19 @@ impl Browser {
                 self.ui.pressed = Some(hit);
             }
             Hit::Nothing | Hit::Content | Hit::Edge => self.focus_page(),
+            Hit::InspInput => {
+                if !self.insp.input_focused {
+                    self.focus_inspector_input();
+                }
+                let idx = self.ui.insp_input_index(self.cursor.0, &self.layout, &self.insp.input.text);
+                if double {
+                    self.insp.input.select_all();
+                } else {
+                    let shift = self.modifiers.shift_key();
+                    self.insp.input.move_to(idx, shift);
+                }
+                self.ui.pressed = Some(hit);
+            }
             _ => self.ui.pressed = Some(hit),
         }
         self.window.request_redraw();
@@ -1115,6 +1321,15 @@ impl Browser {
 
     /// Tab ziehen (auf die Seite = teilen, aus einem Paar in die Leiste = lösen) und Trennlinie.
     fn drag_move(&mut self) {
+        if self.ui.pressed == Some(Hit::InspResize) {
+            let s = self.layout.scale;
+            let w = ((self.layout.width - self.cursor.0) / s).clamp(inspector::MIN_W, inspector::MAX_W);
+            if (w - self.insp.width).abs() >= 1.0 {
+                self.insp.width = w;
+                self.relayout();
+            }
+            return;
+        }
         if self.ui.pressed == Some(Hit::Divider) {
             let c = self.layout.content;
             if c.w > 0.0 {
@@ -1176,7 +1391,7 @@ impl Browser {
         if self.drag_end() {
             return;
         }
-        if pressed == Some(Hit::Divider) {
+        if pressed == Some(Hit::Divider) || pressed == Some(Hit::InspResize) {
             return;
         }
         if pressed != Some(self.ui.hover) {
@@ -1226,6 +1441,27 @@ impl Browser {
             }
             Hit::Favorite(i) => self.open_favorite(i),
             Hit::Suggestion(i) => self.open_suggestion(i),
+            Hit::InspTab(i) => {
+                self.insp.tab = inspector::TABS[i];
+                if self.insp.tab != inspector::Tab::Console {
+                    self.insp.input_focused = false;
+                }
+                self.relayout();
+            }
+            Hit::InspPick => self.toggle_pick(),
+            Hit::InspClear => {
+                match self.insp.tab {
+                    inspector::Tab::Console => self.insp.clear_console(),
+                    inspector::Tab::Network => {
+                        self.insp.requests.clear();
+                        self.insp.blocked.clear();
+                        self.insp.scroll[2] = 0.0;
+                    }
+                    inspector::Tab::Element => {}
+                }
+                self.window.request_redraw();
+            }
+            Hit::InspClose => self.toggle_inspector(),
             _ => {}
         }
     }
@@ -1283,6 +1519,16 @@ impl Browser {
                 self.ui.show_fps = !self.ui.show_fps;
                 self.window.request_redraw();
             }
+            // Inspektor: F12 oder Strg+Umschalt+I; Strg+Umschalt+C startet gleich den Picker.
+            Key::Named(NamedKey::F12) => self.toggle_inspector(),
+            Key::Character(c) if ctrl && shift && char_is(c, "i") => self.toggle_inspector(),
+            Key::Character(c) if ctrl && shift && char_is(c, "c") => {
+                if !self.insp.open {
+                    self.toggle_inspector();
+                }
+                self.toggle_pick();
+            }
+            Key::Named(NamedKey::Escape) if self.insp.picking => self.toggle_pick(),
             _ => return false,
         }
         true
@@ -1291,6 +1537,12 @@ impl Browser {
     fn key(&mut self, event_loop: &ActiveEventLoop, event: KeyEvent) {
         let pressed = event.state == ElementState::Pressed;
         if pressed && self.shortcut(event_loop, &event.logical_key) {
+            return;
+        }
+        if self.insp.input_focused {
+            if pressed {
+                self.inspector_key(&event);
+            }
             return;
         }
         if !self.ui.url_focused {
@@ -1375,6 +1627,7 @@ impl Browser {
         let tabs = self.engine.tabs();
         let active = self.engine.active();
         let page = tabs.get(active).cloned().unwrap_or_default();
+        self.inspector_sync(active, &page);
         let animating = self.ui.animate(&page) || sliding;
         let stats = Stats {
             ui_fps: self.ui_fps.fps(),
@@ -1412,6 +1665,7 @@ impl Browser {
             is_favorite,
             card: card_text.as_ref().map(|(title, detail, primary, secondary)| ui::Card { title, detail, primary, secondary }),
             downloads: &sidebar_downloads,
+            inspector: self.insp.open.then_some(&self.insp),
         };
         let background = self.ui.theme().bg;
         let mut frame = self.ui.build(self.renderer.font_system(), &self.layout, &view, &stats);

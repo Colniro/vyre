@@ -465,6 +465,8 @@ impl WebViewDelegate for Delegate {
         if self.shared.blocker.should_block(url.as_str(), &page, kind) {
             log::debug!("blockiert: {url}");
             self.state.borrow_mut().blocked += 1;
+            // Für die Netzwerk-Liste des Inspektors.
+            self.shared.pw_messages.borrow_mut().push((webview.id(), page.clone(), crate::inspector::blocked_message(url.as_str())));
             self.shared.main.request_redraw();
             load.intercept(WebResourceResponse::new(url)).cancel();
         }
@@ -517,7 +519,8 @@ impl WebViewDelegate for Delegate {
             }
             return;
         }
-        if message.starts_with(crate::pwfill::PREFIX) {
+        // Auch die Nachrichten des Inspektors gehen diesen Weg.
+        if message.starts_with(crate::pwfill::PREFIX) || message.starts_with(crate::inspector::PREFIX) {
             if let Some(url) = webview.url() {
                 self.shared.pw_messages.borrow_mut().push((webview.id(), url.to_string(), message));
                 self.shared.main.request_redraw();

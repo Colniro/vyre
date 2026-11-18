@@ -11,6 +11,9 @@ use winit::window::ResizeDirection;
 
 use crate::engine::{PageState, Row};
 use crate::history::Favorite;
+use crate::inspector::Inspector;
+
+mod panel;
 use crate::render::{Attrs, Buffer, Family, FontSystem, Metrics, Quad, RoundRect, Rgba, Shaping, TextBlock, Weight, Wrap};
 
 /// Farben der Oberfläche (dunkel, violetter Akzent).
@@ -145,7 +148,31 @@ pub enum Hit {
     Drag,
     Resize(ResizeDirection),
     Content,
+    /// Inspektor rechts: Reiter, Zielkreuz, Leeren, Schließen, Rand zum Ziehen, Eingabe, Rest.
+    InspTab(usize),
+    InspPick,
+    InspClear,
+    InspClose,
+    InspResize,
+    InspInput,
+    InspBody,
     Nothing,
+}
+
+/// Flächen der Inspektor-Leiste.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InspLayout {
+    pub panel: Rect,
+    /// Spalt links neben der Leiste (zum Ziehen der Breite).
+    pub resize: Rect,
+    pub tabs: [Rect; 3],
+    pub pick: Rect,
+    pub clear: Rect,
+    pub close: Rect,
+    /// Inhalt des Reiters.
+    pub body: Rect,
+    /// Eingabezeile der Konsole.
+    pub input: Rect,
 }
 
 /// Feste Knöpfe der oberen Zeile, in dieser Reihenfolge in `Layout::top`.
@@ -207,6 +234,8 @@ pub struct Layout {
     pub new_private: Option<Rect>,
     pub content: Rect,
     pub fps: Rect,
+    /// Inspektor rechts, wenn offen.
+    pub insp: Option<InspLayout>,
 }
 
 /// Wie viele Einträge die Seitenleiste zeigt.
@@ -221,6 +250,8 @@ pub struct Counts {
     pub downloads: usize,
     /// Zeile "Privates Fenster" anzeigen (nicht im privaten Fenster selbst).
     pub private_button: bool,
+    /// Inspektor offen: Breite (logische Pixel) und ob der Konsolen-Reiter (mit Eingabe) aktiv ist.
+    pub inspector: Option<(f32, bool)>,
 }
 
 const FAVS_PER_ROW: usize = 6;
@@ -287,15 +318,42 @@ impl Layout {
         let new_tab = row(tab_count);
 
         // Fest: Seite neben der Leiste. Hover: Seite fast fensterbreit, beim Ausfahren verschoben.
+        // Mit Inspektor rechts wird die Seite schmaler (im Hover-Modus beim Ausfahren auch, damit
+        // sie nicht unter die Leiste rutscht).
+        let pw = counts.inspector.map(|(iw, _)| (iw * s).round().min(w * 0.7)).unwrap_or(0.0);
         let content = match mode {
-            SidebarMode::Pinned => Rect { x: sw, y: gap, w: (w - sw - gap).max(1.0), h: (h - 2.0 * gap).max(1.0) },
+            SidebarMode::Pinned => Rect { x: sw, y: gap, w: (w - sw - gap - pw).max(1.0), h: (h - 2.0 * gap).max(1.0) },
             SidebarMode::Hover => Rect {
                 x: (gap + reveal * (sw - gap)).round(),
                 y: gap,
-                w: (w - 2.0 * gap).max(1.0),
+                w: (w - 2.0 * gap - pw - if pw > 0.0 { reveal * (sw - gap) } else { 0.0 }).max(1.0),
                 h: (h - 2.0 * gap).max(1.0),
             },
         };
+        let insp = counts.inspector.map(|(_, console)| {
+            let p = Rect { x: w - pw, y: gap, w: (pw - gap).max(1.0), h: (h - 2.0 * gap).max(1.0) };
+            let hy = p.y + 8.0 * s;
+            let bh = 30.0 * s;
+            let close = Rect { x: p.x + p.w - 8.0 * s - 30.0 * s, y: hy, w: 30.0 * s, h: bh };
+            let clear = Rect { x: close.x - 32.0 * s, ..close };
+            let pick = Rect { x: clear.x - 32.0 * s, ..close };
+            let tabs_x = p.x + 8.0 * s;
+            let tw = ((pick.x - 6.0 * s - tabs_x) / 3.0).min(96.0 * s).max(1.0);
+            let tab = |i: usize| Rect { x: tabs_x + i as f32 * tw, y: hy, w: tw - 2.0 * s, h: bh };
+            let input = Rect { x: p.x + 8.0 * s, y: p.y + p.h - 8.0 * s - 34.0 * s, w: p.w - 16.0 * s, h: 34.0 * s };
+            let by = hy + bh + 14.0 * s;
+            let bottom = if console { input.y - 8.0 * s } else { p.y + p.h - 10.0 * s };
+            InspLayout {
+                panel: p,
+                resize: Rect { x: p.x - gap - 2.0 * s, y: p.y, w: gap + 4.0 * s, h: p.h },
+                tabs: [tab(0), tab(1), tab(2)],
+                pick,
+                clear,
+                close,
+                body: Rect { x: p.x + 12.0 * s, y: by, w: p.w - 24.0 * s, h: (bottom - by).max(0.0) },
+                input,
+            }
+        });
         let fps = Rect { x: sx + pad + 4.0 * s, y: h - 46.0 * s, w: sw - 2.0 * pad, h: 40.0 * s };
         let dl_h = 46.0 * s;
         let downloads: Vec<Rect> = (0..counts.downloads)
@@ -339,6 +397,7 @@ impl Layout {
             row_w: sw - 2.0 * pad,
             first_row_y: first,
             fps,
+            insp,
         }
     }
 
@@ -410,6 +469,27 @@ impl Layout {
             };
             if let Some(dir) = dir {
                 return Hit::Resize(dir);
+            }
+        }
+        if let Some(p) = &self.insp {
+            if p.resize.contains(x, y) {
+                return Hit::InspResize;
+            }
+            if p.panel.contains(x, y) {
+                for (i, r) in p.tabs.iter().enumerate() {
+                    if r.contains(x, y) {
+                        return Hit::InspTab(i);
+                    }
+                }
+                for (r, hit) in [(p.pick, Hit::InspPick), (p.clear, Hit::InspClear), (p.close, Hit::InspClose)] {
+                    if r.contains(x, y) {
+                        return hit;
+                    }
+                }
+                if !p.body.contains(x, y) && p.input.contains(x, y) {
+                    return Hit::InspInput;
+                }
+                return Hit::InspBody;
             }
         }
         if self.over_sidebar(x) {
@@ -779,6 +859,8 @@ pub struct Ui {
     /// Horizontales Verschieben des URL-Textes, damit der Cursor sichtbar bleibt.
     url_scroll: f32,
     pub show_fps: bool,
+    mono_family: String,
+    panel: panel::PanelLabels,
 }
 
 /// Was gezeichnet werden soll.
@@ -829,6 +911,8 @@ pub struct TabsView<'a> {
     pub card: Option<Card<'a>>,
     /// Downloads für die Seitenleiste.
     pub downloads: &'a [crate::downloads::Entry],
+    /// Inspektor, wenn offen.
+    pub inspector: Option<&'a Inspector>,
 }
 
 fn paired(layout: &Layout, i: usize) -> Option<(usize, usize, Rect)> {
@@ -850,7 +934,12 @@ impl Ui {
             .find(|f| has_family(fs, f))
             .unwrap_or("Segoe MDL2 Assets")
             .to_string();
-        log::info!("UI-Schrift: {ui_family}, Symbole: {icon_family}");
+        let mono_family = ["Cascadia Mono", "Cascadia Code", "Consolas", "Courier New"]
+            .into_iter()
+            .find(|f| has_family(fs, f))
+            .unwrap_or("monospace")
+            .to_string();
+        log::info!("UI-Schrift: {ui_family}, Symbole: {icon_family}, Konsole: {mono_family}");
         Self {
             url: TextField::default(),
             url_focused: false,
@@ -881,6 +970,8 @@ impl Ui {
             theme: &THEME,
             private: false,
             fps_label: Label::new(fs),
+            panel: panel::PanelLabels::new(fs),
+            mono_family,
             ui_family,
             icon_family,
             url_scroll: 0.0,
@@ -920,7 +1011,7 @@ impl Ui {
             targets.push(Hit::Tab(i));
         }
         for t in &targets {
-            if !matches!(t, Hit::Nothing | Hit::Drag | Hit::Content | Hit::Edge | Hit::Resize(_))
+            if !matches!(t, Hit::Nothing | Hit::Drag | Hit::Content | Hit::Edge | Hit::Resize(_) | Hit::InspBody | Hit::InspInput)
                 && !self.anims.iter().any(|(h, _)| h == t)
             {
                 self.anims.push((*t, 0.0));
@@ -977,6 +1068,9 @@ impl Ui {
         let mut cards = Vec::new();
         let mut under = Vec::new();
         let mut over = Vec::new();
+        if let (Some(p), Some(insp)) = (layout.insp.as_ref(), tabs.inspector) {
+            self.panel_prepare(fs, p, insp, s, &mut cards, &mut under, &mut over);
+        }
         // Alles in der Seitenleiste wird auf ihren sichtbaren Teil beschnitten.
         let side_clip = [0, 0, (layout.sidebar_x + layout.sidebar_w).max(0.0) as i32, layout.height as i32];
 
@@ -1474,6 +1568,9 @@ impl Ui {
             }
         }
 
+        if layout.insp.is_some() && tabs.inspector.is_some() {
+            self.panel_text(&mut text);
+        }
         Frame { cards, under, text, over, overlay_cards, overlay: Vec::new(), overlay_text }
     }
 }
@@ -1566,13 +1663,13 @@ mod tests {
 
     #[test]
     fn favoriten_und_vorschlaege() {
-        let l = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 1.0, Counts { tabs: 2, favorites: 7, suggestions: 3, prompt: false, downloads: 0, private_button: false });
+        let l = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 1.0, Counts { tabs: 2, favorites: 7, suggestions: 3, prompt: false, downloads: 0, private_button: false, inspector: None });
         // 6 Favoriten pro Reihe, der siebte rutscht in die zweite Reihe.
         assert_eq!(l.favorites[6].x, l.favorites[0].x);
         assert!(l.favorites[6].y > l.favorites[0].y);
         assert!(l.tabs_label.y > l.favorites[6].y + l.favorites[6].h);
         // Ohne Vorschläge trifft man den Favoriten …
-        let plain = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 1.0, Counts { tabs: 2, favorites: 7, suggestions: 0, prompt: false, downloads: 0, private_button: false });
+        let plain = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 1.0, Counts { tabs: 2, favorites: 7, suggestions: 0, prompt: false, downloads: 0, private_button: false, inspector: None });
         let f = plain.favorites[1];
         assert_eq!(plain.hit(f.x + 3.0, f.y + 3.0, false), Hit::Favorite(1));
         // … mit Vorschlägen liegen diese darüber und gewinnen.

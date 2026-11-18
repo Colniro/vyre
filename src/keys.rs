@@ -67,12 +67,12 @@ pub fn is_browser_shortcut(key: &winit::keyboard::Key, mods: ModifiersState) -> 
         K::Character(c) if ctrl => {
             let c = c.to_ascii_lowercase();
             matches!(c.as_str(), "l" | "r" | "t" | "w" | "b" | "d" | "h" | "s" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
-                || (shift && (c == "e" || c == "z" || c == "n"))
+                || (shift && matches!(c.as_str(), "e" | "z" | "n" | "i" | "c"))
         }
         K::Named(WinitNamed::Tab) => ctrl,
         K::Named(WinitNamed::Delete) => ctrl && shift,
         K::Named(WinitNamed::ArrowLeft | WinitNamed::ArrowRight) => alt,
-        K::Named(WinitNamed::F2 | WinitNamed::F3 | WinitNamed::F5 | WinitNamed::F6) => true,
+        K::Named(WinitNamed::F2 | WinitNamed::F3 | WinitNamed::F5 | WinitNamed::F6 | WinitNamed::F12) => true,
         _ => false,
     }
 }
@@ -91,5 +91,7 @@ mod tests {
         assert!(!is_browser_shortcut(&ch("c"), ModifiersState::CONTROL));
         assert!(!is_browser_shortcut(&ch("t"), ModifiersState::empty()));
         assert!(is_browser_shortcut(&Key::Named(WinitNamed::F5), ModifiersState::empty()));
+        assert!(is_browser_shortcut(&Key::Named(WinitNamed::F12), ModifiersState::empty()));
+        assert!(is_browser_shortcut(&ch("I"), ModifiersState::CONTROL | ModifiersState::SHIFT));
     }
 }

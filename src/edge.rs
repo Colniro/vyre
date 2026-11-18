@@ -309,7 +309,7 @@ fn setup(
             &WebMessageReceivedEventHandler::create(Box::new(move |sender, args| {
                 let (Some(wv), Some(a)) = (sender, args) else { return Ok(()) };
                 let message = read(|p| a.TryGetWebMessageAsString(p));
-                if message.starts_with(crate::pwfill::PREFIX) {
+                if message.starts_with(crate::pwfill::PREFIX) || message.starts_with(crate::inspector::PREFIX) {
                     let page = read(|p| wv.Source(p));
                     sh.events.borrow_mut().push((id, EdgeEvent::Message(page, message)));
                     sh.main.request_redraw();
@@ -563,6 +563,7 @@ fn setup(
                     )?;
                     a.SetResponse(&response)?;
                     st.borrow_mut().blocked += 1;
+                    sh.events.borrow_mut().push((id, EdgeEvent::Message(page.clone(), crate::inspector::blocked_message(&uri))));
                     sh.main.request_redraw();
                 }
                 Ok(())

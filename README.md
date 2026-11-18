@@ -55,6 +55,19 @@ Der erste Build dauert lange, weil Servo mitgebaut wird. SpiderMonkey wird ferti
 | Strg+Umschalt+C | Element-Picker des Inspektors |
 | ↑ / ↓ in der Adressleiste | Vorschlag wählen |
 
+## Bild-in-Bild
+
+Fährt man mit der Maus über ein Video, erscheint oben rechts der Knopf **Bild-in-Bild**. Das
+Video läuft dann ohne Unterbrechung in einem kleinen Fenster über allen anderen weiter (auch bei
+YouTube): Ziehen am Video verschiebt es, die Ecke unten rechts ändert die Größe, ein Klick hält
+an. Beim Hovern: −10 s, Play/Pause, +10 s, **Zum Tab** und ✕ (das Video läuft im Tab weiter).
+Leertaste und ←/→ gehen auch. Platz und Größe merkt sich Vyre.
+
+Technik: Videos spielen in Vyre nur in WebView2-Tabs (Servo ist ohne Medien gebaut). Der ganze
+Tab zieht ins kleine Fenster um, ein Skript streckt das Video auf die Fläche. Findet die
+Seitenprüfung in einem Servo-Tab ein richtiges Video (keine stummen Hintergrund-Videos), wechselt
+der Tab von selbst zu WebView2 und merkt sich das für die Seite.
+
 ## Inspektor
 
 F12 öffnet rechts eine Leiste für Webentwickler (die Seite wird schmaler, die Breite lässt sich
@@ -271,6 +284,7 @@ die Vyre von sich aus aufbaut.
 - `src/importer.rs`: Import aus Chrome/Edge/Brave, Firefox/Zen und CSV
 - `src/ipc.rs`: Steuerkanal (Named Pipe), `vyre`-Befehle, PATH-Eintrag
 - `src/settings.rs`: gespeicherte Einstellungen
+- `src/pip.rs`: Bild-in-Bild (Seitenskript, Nachrichten, Fensterplatz)
 - `src/inspector.rs`, `src/ui/panel.rs`: Inspektor (Skript in der Seite, Daten, Leiste)
 - `src/update.rs`: Update-Prüfung, Download mit Prüfsumme, Installer starten
 - `installer/vyre.iss`, `scripts/release.ps1`: Installer und Release

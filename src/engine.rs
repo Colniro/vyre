@@ -61,12 +61,13 @@ pub(crate) const COLLECT_CLASSES_IDS: &str = "(function(){var c=new Set(),i=new 
     if(e.classList)e.classList.forEach(function(x){c.add(x)});});\
     return [Array.from(c),Array.from(i)];})()";
 
-/// Prüft nach dem Laden, ob die Seite in Servo gescheitert ist: Textlänge, Anzahl Elemente und
-/// ob sie "Browser nicht unterstützt" o. ä. meldet.
+/// Prüft nach dem Laden, ob die Seite in Servo gescheitert ist: Textlänge, Anzahl Elemente,
+/// ob sie "Browser nicht unterstützt" o. ä. meldet und ob sie ein Video hat (Servo spielt in Vyre
+/// keine Videos ab; Hintergrund-Videos ohne Ton und in Schleife zählen nicht).
 const PROBE_PAGE: &str = "(function(){var b=document.body;if(!b)return [0,0,false];\
     var t=(b.innerText||'').trim();var l=t.slice(0,6000).toLowerCase();\
-    var bad=/(browser|browsers)[^.]{0,40}(not supported|isn't supported|is not supported|unsupported|nicht unterst\u{fc}tzt)|unsupported browser|update your browser|upgrade your browser|switch to a supported browser|use a supported browser|aktualisiere deinen browser|browser wird nicht unterst\u{fc}tzt/.test(l);\
-    return [t.length,b.getElementsByTagName('*').length,bad];})()";
+    var vid=false;document.querySelectorAll('video').forEach(function(m){var r=m.getBoundingClientRect();    if(r.width>=200&&r.height>=110&&(m.controls||!(m.muted&&m.loop)))vid=true;});    if(document.querySelector('iframe[src*=\"youtube.com/embed\"],iframe[src*=\"youtube-nocookie.com/embed\"],iframe[src*=\"player.vimeo.com\"],iframe[src*=\"player.twitch.tv\"],iframe[src*=\"dailymotion.com/embed\"]'))vid=true;    var bad=/(browser|browsers)[^.]{0,40}(not supported|isn't supported|is not supported|unsupported|nicht unterst\u{fc}tzt)|unsupported browser|update your browser|upgrade your browser|switch to a supported browser|use a supported browser|aktualisiere deinen browser|browser wird nicht unterst\u{fc}tzt/.test(l);\
+    return [t.length,b.getElementsByTagName('*').length,bad,vid];})()";
 
 /// Nach so langer Zeit ohne Benutzung schläft ein Tab ein.
 const SLEEP_AFTER: Duration = Duration::from_secs(10 * 60);
@@ -177,6 +178,14 @@ pub trait Engine {
     fn sleep_active(&mut self);
     /// Führt ein Skript in einem Tab aus (ohne auf das Ergebnis zu warten).
     fn eval_in(&self, tab: usize, script: &str);
+    /// Bild-in-Bild: Der (WebView2-)Tab zieht in `window` um und füllt es. `false` bei Servo-Tabs.
+    fn pip_start(&mut self, tab: usize, window: &Window) -> bool;
+    /// Größe des Bild-in-Bild-Fensters (physische Pixel).
+    fn pip_resize(&self, width: u32, height: u32);
+    /// Holt den Tab ins Hauptfenster zurück; liefert seine Nummer.
+    fn pip_end(&mut self) -> Option<usize>;
+    /// Welcher Tab gerade im Bild-in-Bild-Fenster ist.
+    fn pip_tab(&self) -> Option<usize>;
     /// Speichert, was im aktiven Tab offen ist, als Download (Strg+S).
     fn save_current(&mut self);
     /// Pausieren, Fortsetzen oder Abbrechen eines Downloads ("pause", "resume", "cancel").
@@ -619,6 +628,8 @@ pub struct ServoEngine {
     active: usize,
     /// Der zuvor aktive Tab (für das Teilen mit dem gerade sichtbaren Tab).
     previous: Option<u64>,
+    /// Tab im Bild-in-Bild-Fenster (bleibt dort, bis es geschlossen wird).
+    pip: Option<u64>,
     next_id: u64,
     pairs: Vec<Pair>,
     edge: EdgeRuntime,
@@ -751,6 +762,7 @@ impl ServoEngine {
             tabs: Vec::new(),
             active: 0,
             previous: None,
+            pip: None,
             next_id: 1,
             pairs: Vec::new(),
             edge,
@@ -981,6 +993,7 @@ impl ServoEngine {
         self.next_sleep_check = now + SLEEP_CHECK_EVERY;
         for (i, tab) in self.tabs.iter().enumerate() {
             if visible.contains(&i)
+                || Some(tab.id) == self.pip
                 || self.sleep_pending.contains(&tab.id)
                 || now.duration_since(tab.last_used.get()) < SLEEP_AFTER
             {
@@ -1015,6 +1028,9 @@ impl ServoEngine {
         let view = self.view();
         let mut surface_used = [false, false];
         for (i, t) in self.tabs.iter().enumerate() {
+            if Some(t.id) == self.pip {
+                continue;
+            }
             let place = view.iter().find(|(v, _)| *v == i).map(|(_, b)| *b);
             match (&t.backend, place) {
                 (Backend::Servo { webview, delegate }, Some(bounds)) => {
@@ -1084,12 +1100,13 @@ impl ServoEngine {
                     _ => 0.0,
                 };
                 let unsupported = matches!(v.get(2), Some(JSValue::Boolean(true)));
+                let video = matches!(v.get(3), Some(JSValue::Boolean(true)));
                 let errors = d.js_errors.get();
-                if looks_broken(num(0), num(1), unsupported, errors) {
+                if video || looks_broken(num(0), num(1), unsupported, errors) {
                     if let Some(url) = wv.url() {
                         log::info!(
                             "{url} scheint in Servo zu scheitern (Text {}, Elemente {}, Fehler {errors}, \
-                             nicht unterstützt: {unsupported}) – wechsle zu WebView2",
+                             nicht unterstützt: {unsupported}, Video: {video}) – wechsle zu WebView2",
                             num(0),
                             num(1)
                         );
@@ -1304,6 +1321,9 @@ impl Engine for ServoEngine {
         if self.previous == Some(id) {
             self.previous = None;
         }
+        if self.pip == Some(id) {
+            self.pip = None;
+        }
         self.tabs.remove(index);
         if self.tabs.is_empty() {
             return false;
@@ -1378,6 +1398,39 @@ impl Engine for ServoEngine {
                 };
             }
         }
+    }
+
+    fn pip_start(&mut self, tab: usize, window: &Window) -> bool {
+        let Some(t) = self.tabs.get(tab) else { return false };
+        let Backend::Edge(e) = &t.backend else { return false };
+        let size = window.inner_size();
+        e.reparent(crate::edge::hwnd(window), (0, 0, size.width.max(1), size.height.max(1)));
+        self.pip = Some(t.id);
+        self.apply_view();
+        true
+    }
+
+    fn pip_resize(&self, width: u32, height: u32) {
+        let Some(i) = self.pip.and_then(|id| self.index_of(id)) else { return };
+        if let Backend::Edge(e) = &self.tabs[i].backend {
+            e.set_bounds((0, 0, width.max(1), height.max(1)));
+        }
+    }
+
+    fn pip_end(&mut self) -> Option<usize> {
+        let id = self.pip.take()?;
+        let i = self.index_of(id)?;
+        if let Backend::Edge(e) = &self.tabs[i].backend {
+            e.reparent(self.edge.parent(), (0, 0, 1, 1));
+            e.set_visible(false);
+        }
+        // Legt Größe und Sichtbarkeit wieder fest (wie bei jedem anderen Tab).
+        self.apply_view();
+        Some(i)
+    }
+
+    fn pip_tab(&self) -> Option<usize> {
+        self.pip.and_then(|id| self.index_of(id))
     }
 
     fn eval_in(&self, tab: usize, script: &str) {

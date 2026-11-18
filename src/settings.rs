@@ -34,6 +34,8 @@ pub struct Settings {
     /// Woher Updates kommen: leer = GitHub-Releases, `aus` = keine automatische Prüfung,
     /// sonst eine Adresse oder ein Pfad zu einer update.json.
     pub updates: String,
+    /// Platz des Bild-in-Bild-Fensters: x, y, Breite, Höhe (physische Pixel).
+    pub pip_rect: Option<[i32; 4]>,
 }
 
 fn default_tiles() -> Vec<Tile> {
@@ -56,6 +58,7 @@ impl Default for Settings {
             tiles: default_tiles(),
             http_allowed: Vec::new(),
             updates: String::new(),
+            pip_rect: None,
         }
     }
 }
@@ -105,6 +108,12 @@ impl Settings {
                         .collect();
                 }
                 "updates" => s.updates = value.to_string(),
+                "bild_in_bild" => {
+                    let n: Vec<i32> = value.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                    if n.len() == 4 && n[2] > 0 && n[3] > 0 {
+                        s.pip_rect = Some([n[0], n[1], n[2], n[3]]);
+                    }
+                }
                 "kacheln" => tiles_set = true,
                 "kachel" => {
                     if let Some((title, url)) = value.split_once('|') {
@@ -131,6 +140,9 @@ impl Settings {
         t += &format!("http_erlaubt = {}\n", self.http_allowed.join(", "));
         t += "# Updates: leer = GitHub, aus = nicht automatisch prüfen, sonst Adresse einer update.json\n";
         t += &format!("updates = {}\n", self.updates);
+        if let Some([x, y, w, h]) = self.pip_rect {
+            t += &format!("# Bild-in-Bild-Fenster: x, y, Breite, Höhe\nbild_in_bild = {x}, {y}, {w}, {h}\n");
+        }
         t += "# Kacheln der Neuer-Tab-Seite: kachel = Titel | Adresse\nkacheln = eigene\n";
         for tile in &self.tiles {
             t += &format!("kachel = {} | {}\n", tile.title.replace('|', "/"), tile.url);
@@ -201,6 +213,7 @@ mod tests {
             tiles: vec![Tile::new("A | B", "https://a.de/")],
             http_allowed: vec!["alt.de".into()],
             updates: "aus".into(),
+            pip_rect: Some([10, -20, 480, 270]),
         };
         let back = Settings::parse(&s.to_text());
         assert_eq!(back.sidebar, SidebarMode::Hover);
@@ -209,6 +222,7 @@ mod tests {
         assert_eq!(back.tiles, [Tile::new("A / B", "https://a.de/")]);
         assert_eq!(back.http_allowed, ["alt.de"]);
         assert_eq!(back.updates, "aus");
+        assert_eq!(back.pip_rect, Some([10, -20, 480, 270]));
     }
 
     #[test]

@@ -15,6 +15,7 @@ mod inspector;
 mod ipc;
 mod keys;
 mod newtab;
+mod pip;
 mod privacy;
 mod pwfill;
 mod render;
@@ -210,6 +211,10 @@ struct Browser {
     update_card: Option<UpdateCard>,
     /// Inspektor rechts (F12).
     insp: inspector::Inspector,
+    /// Kleines Fenster über allem anderen, in dem ein Video weiterläuft.
+    pip_window: Option<Arc<Window>>,
+    /// Beim Verschieben/Größe ändern des Bild-in-Bild-Fensters: Ausgangsposition und -größe.
+    pip_origin: Option<(PhysicalPosition<i32>, PhysicalSize<u32>)>,
     /// Skript des Inspektors in die Seite legen, sobald sie fertig geladen ist.
     insp_inject: bool,
     /// Lud die Seite beim letzten Zeichnen (um Neuladen zu erkennen)?
@@ -274,7 +279,9 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         let Some(b) = &mut self.browser else { return };
-        if b.engine.owns_window(id) {
+        if b.pip_window.as_ref().is_some_and(|w| w.id() == id) {
+            b.pip_window_event(event);
+        } else if b.engine.owns_window(id) {
             b.page_window_event(id, &event);
         } else {
             b.main_window_event(event_loop, event);
@@ -445,6 +452,8 @@ impl Browser {
             pending_save: None,
             update_card: None,
             insp: inspector::Inspector::default(),
+            pip_window: None,
+            pip_origin: None,
             insp_inject: false,
             insp_loading: false,
             update_reply: None,
@@ -482,6 +491,9 @@ impl Browser {
                         self.ui.suggestions.clear();
                         self.relayout();
                     }
+                }
+                EngineEvent::Password { tab, message, .. } if message.starts_with(pip::PREFIX) => {
+                    self.pip_message(event_loop, tab, &message);
                 }
                 EngineEvent::Password { tab, message, .. } if message.starts_with(inspector::PREFIX) => {
                     self.inspector_message(tab, &message);
@@ -645,6 +657,7 @@ impl Browser {
                 downloads: self.downloads.sidebar().len(),
                 private_button: !self.ui.private,
                 inspector: self.insp.open.then_some((self.insp.width, self.insp.tab == inspector::Tab::Console)),
+                pip_here: self.engine.pip_tab().is_some_and(|t| t == self.engine.active()),
             },
         )
         .with_split(&self.engine.rows(), self.engine.ratio(), self.drop_side);
@@ -950,6 +963,123 @@ impl Browser {
         }
     }
 
+    /// Nachricht des Bild-in-Bild-Skripts einer Seite.
+    fn pip_message(&mut self, event_loop: &ActiveEventLoop, tab: usize, message: &str) {
+        let Some(m) = pip::parse(message) else { return };
+        let in_pip = self.engine.pip_tab() == Some(tab);
+        log::debug!("Bild-in-Bild: {m:?} von Tab {tab}");
+        match m {
+            pip::Message::Start => self.pip_open(event_loop, tab),
+            pip::Message::Close if in_pip => self.pip_close(),
+            pip::Message::Back if in_pip => {
+                self.pip_close();
+                self.select_tab(tab);
+                self.window.set_minimized(false);
+                self.window.focus_window();
+            }
+            pip::Message::DragStart | pip::Message::ResizeStart if in_pip => {
+                if let Some(w) = &self.pip_window {
+                    self.pip_origin = w.outer_position().ok().map(|p| (p, w.inner_size()));
+                }
+            }
+            pip::Message::Drag(dx, dy) if in_pip => {
+                if let (Some(w), Some((p, _))) = (&self.pip_window, self.pip_origin) {
+                    w.set_outer_position(PhysicalPosition::new(p.x + dx, p.y + dy));
+                }
+            }
+            pip::Message::Resize(dx, dy) if in_pip => {
+                if let (Some(w), Some((_, size))) = (&self.pip_window, self.pip_origin) {
+                    let s = w.scale_factor();
+                    let width = (size.width as i32 + dx).max((pip::MIN_W * s) as i32) as u32;
+                    let height = (size.height as i32 + dy).max((pip::MIN_H * s) as i32) as u32;
+                    let _ = w.request_inner_size(PhysicalSize::new(width, height));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Öffnet das Bild-in-Bild-Fenster für einen (WebView2-)Tab.
+    fn pip_open(&mut self, event_loop: &ActiveEventLoop, tab: usize) {
+        if self.pip_window.is_some() {
+            self.pip_close();
+        }
+        let screens: Vec<[i32; 4]> = self
+            .window
+            .available_monitors()
+            .map(|m| [m.position().x, m.position().y, m.size().width as i32, m.size().height as i32])
+            .collect();
+        let area = self
+            .window
+            .current_monitor()
+            .map(|m| [m.position().x, m.position().y, m.size().width as i32, m.size().height as i32])
+            .unwrap_or([0, 0, 1920, 1080]);
+        let scale = self.window.scale_factor();
+        let saved = self.settings.get().pip_rect.filter(|r| pip::on_screen(*r, &screens));
+        let [x, y, w, h] = saved.unwrap_or_else(|| pip::default_rect(area, scale));
+        #[allow(unused_mut)]
+        let mut attrs = Window::default_attributes()
+            .with_title("Vyre – Bild-in-Bild")
+            .with_decorations(false)
+            .with_window_level(winit::window::WindowLevel::AlwaysOnTop)
+            .with_min_inner_size(LogicalSize::new(pip::MIN_W, pip::MIN_H))
+            .with_inner_size(PhysicalSize::new(w.max(1) as u32, h.max(1) as u32))
+            .with_position(PhysicalPosition::new(x, y));
+        #[cfg(windows)]
+        {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs = attrs.with_skip_taskbar(true);
+        }
+        let window = match event_loop.create_window(attrs) {
+            Ok(w) => Arc::new(w),
+            Err(e) => {
+                log::warn!("Bild-in-Bild-Fenster nicht erstellt: {e}");
+                return;
+            }
+        };
+        #[cfg(windows)]
+        win::style_pip_window(&window);
+        if !self.engine.pip_start(tab, &window) {
+            log::info!("Bild-in-Bild geht nur in WebView2-Tabs");
+            return;
+        }
+        log::info!("Bild-in-Bild für Tab {tab} geöffnet ({w}×{h} bei {x},{y})");
+        self.engine.eval_in(tab, pip::ENTER_SCRIPT);
+        self.pip_window = Some(window);
+        self.relayout();
+    }
+
+    /// Schließt das Bild-in-Bild-Fenster; das Video läuft im Tab weiter.
+    fn pip_close(&mut self) {
+        if let Some(tab) = self.engine.pip_end() {
+            self.engine.eval_in(tab, pip::EXIT_SCRIPT);
+        }
+        self.pip_window = None;
+        self.pip_origin = None;
+        self.relayout();
+    }
+
+    fn pip_window_event(&mut self, event: WindowEvent) {
+        let Some(w) = self.pip_window.clone() else { return };
+        match event {
+            WindowEvent::CloseRequested => self.pip_close(),
+            WindowEvent::Resized(size) => {
+                self.engine.pip_resize(size.width, size.height);
+                self.remember_pip(&w);
+            }
+            WindowEvent::Moved(_) => self.remember_pip(&w),
+            _ => {}
+        }
+    }
+
+    /// Merkt sich Platz und Größe für das nächste Mal.
+    fn remember_pip(&self, w: &Window) {
+        if let Ok(p) = w.outer_position() {
+            let size = w.inner_size();
+            self.settings.update(|s| s.pip_rect = Some([p.x, p.y, size.width as i32, size.height as i32]));
+        }
+    }
+
     /// F12: Inspektor öffnen oder schließen.
     fn toggle_inspector(&mut self) {
         self.insp.open = !self.insp.open;
@@ -1229,6 +1359,10 @@ impl Browser {
             event_loop.exit();
             return;
         }
+        // Lief der Tab im Bild-in-Bild-Fenster, ist das Fenster jetzt leer.
+        if self.pip_window.is_some() && self.engine.pip_tab().is_none() {
+            self.pip_window = None;
+        }
         self.relayout();
         if self.ui.url_focused {
             self.focus_url();
@@ -1462,6 +1596,7 @@ impl Browser {
                 self.window.request_redraw();
             }
             Hit::InspClose => self.toggle_inspector(),
+            Hit::PipBack => self.pip_close(),
             _ => {}
         }
     }
@@ -1495,6 +1630,9 @@ impl Browser {
             }
             // Notausgang: Engine des Tabs von Hand wechseln (Servo <-> WebView2).
             Key::Character(c) if ctrl && shift && char_is(c, "e") => {
+                if self.engine.pip_tab() == Some(self.engine.active()) {
+                    self.pip_close();
+                }
                 self.engine.toggle_engine();
                 self.relayout();
             }

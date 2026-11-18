@@ -156,6 +156,8 @@ pub enum Hit {
     InspResize,
     InspInput,
     InspBody,
+    /// Karte im Seitenbereich, wenn der Tab im Bild-in-Bild-Fenster läuft.
+    PipBack,
     Nothing,
 }
 
@@ -236,6 +238,8 @@ pub struct Layout {
     pub fps: Rect,
     /// Inspektor rechts, wenn offen.
     pub insp: Option<InspLayout>,
+    /// Karte "Läuft im Bild-in-Bild-Fenster" (zum Zurückholen).
+    pub pip_back: Option<Rect>,
 }
 
 /// Wie viele Einträge die Seitenleiste zeigt.
@@ -252,6 +256,8 @@ pub struct Counts {
     pub private_button: bool,
     /// Inspektor offen: Breite (logische Pixel) und ob der Konsolen-Reiter (mit Eingabe) aktiv ist.
     pub inspector: Option<(f32, bool)>,
+    /// Der aktive Tab läuft im Bild-in-Bild-Fenster.
+    pub pip_here: bool,
 }
 
 const FAVS_PER_ROW: usize = 6;
@@ -330,6 +336,10 @@ impl Layout {
                 h: (h - 2.0 * gap).max(1.0),
             },
         };
+        let pip_back = counts.pip_here.then(|| {
+            let (cw, ch) = ((360.0 * s).min(content.w - 20.0 * s), 92.0 * s);
+            Rect { x: (content.x + (content.w - cw) / 2.0).round(), y: (content.y + (content.h - ch) / 2.0).round(), w: cw, h: ch }
+        });
         let insp = counts.inspector.map(|(_, console)| {
             let p = Rect { x: w - pw, y: gap, w: (pw - gap).max(1.0), h: (h - 2.0 * gap).max(1.0) };
             let hy = p.y + 8.0 * s;
@@ -398,6 +408,7 @@ impl Layout {
             first_row_y: first,
             fps,
             insp,
+            pip_back,
         }
     }
 
@@ -551,6 +562,9 @@ impl Layout {
         }
         if self.divider.is_some_and(|d| d.contains(x, y)) {
             return Hit::Divider;
+        }
+        if self.pip_back.is_some_and(|r| r.contains(x, y)) {
+            return Hit::PipBack;
         }
         if self.content.contains(x, y) {
             return Hit::Content;
@@ -837,6 +851,7 @@ pub struct Ui {
     shield_count: Label,
     star_icon: Label,
     pw_labels: [Label; 5],
+    pip_labels: [Label; 2],
     dl_labels: Vec<[Label; 3]>,
     fav_labels: Vec<Label>,
     sug_labels: Vec<SuggestionLabels>,
@@ -955,6 +970,7 @@ impl Ui {
             shield_count: Label::new(fs),
             star_icon: Label::new(fs),
             pw_labels: [Label::new(fs), Label::new(fs), Label::new(fs), Label::new(fs), Label::new(fs)],
+            pip_labels: [Label::new(fs), Label::new(fs)],
             dl_labels: Vec::new(),
             fav_labels: Vec::new(),
             sug_labels: Vec::new(),
@@ -1068,6 +1084,13 @@ impl Ui {
         let mut cards = Vec::new();
         let mut under = Vec::new();
         let mut over = Vec::new();
+        if let Some(r) = layout.pip_back {
+            let a = self.anim(Hit::PipBack);
+            cards.push(RoundRect::shadow(r.x, r.y, r.w, r.h, Rgba(0, 0, 0, 80), 12.0 * s, 6.0 * s));
+            cards.push(RoundRect::new(r.x, r.y, r.w, r.h, lerp(t.surface, t.hover, a), 12.0 * s));
+            self.pip_labels[0].set(fs, "Läuft im Bild-in-Bild-Fenster", 15.0 * s, &self.ui_family, true);
+            self.pip_labels[1].set(fs, "Klicken, um das Video hierher zurückzuholen", 12.5 * s, &self.ui_family, false);
+        }
         if let (Some(p), Some(insp)) = (layout.insp.as_ref(), tabs.inspector) {
             self.panel_prepare(fs, p, insp, s, &mut cards, &mut under, &mut over);
         }
@@ -1568,6 +1591,19 @@ impl Ui {
             }
         }
 
+        if let Some(r) = layout.pip_back {
+            let [title, hint] = &self.pip_labels;
+            let clip = Some([r.x.max(0.0) as i32, r.y as i32, (r.x + r.w) as i32, (r.y + r.h) as i32]);
+            let mid = r.y + r.h / 2.0;
+            text.push(TextBlock {
+                buffer: &title.buffer,
+                x: (r.x + (r.w - title.width()) / 2.0).round(),
+                y: (mid - title.line_height() - 1.0 * s).round(),
+                color: t.text,
+                clip,
+            });
+            text.push(TextBlock { buffer: &hint.buffer, x: (r.x + (r.w - hint.width()) / 2.0).round(), y: (mid + 3.0 * s).round(), color: t.dim, clip });
+        }
         if layout.insp.is_some() && tabs.inspector.is_some() {
             self.panel_text(&mut text);
         }
@@ -1663,13 +1699,13 @@ mod tests {
 
     #[test]
     fn favoriten_und_vorschlaege() {
-        let l = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 1.0, Counts { tabs: 2, favorites: 7, suggestions: 3, prompt: false, downloads: 0, private_button: false, inspector: None });
+        let l = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 1.0, Counts { tabs: 2, favorites: 7, suggestions: 3, prompt: false, downloads: 0, private_button: false, inspector: None, pip_here: false });
         // 6 Favoriten pro Reihe, der siebte rutscht in die zweite Reihe.
         assert_eq!(l.favorites[6].x, l.favorites[0].x);
         assert!(l.favorites[6].y > l.favorites[0].y);
         assert!(l.tabs_label.y > l.favorites[6].y + l.favorites[6].h);
         // Ohne Vorschläge trifft man den Favoriten …
-        let plain = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 1.0, Counts { tabs: 2, favorites: 7, suggestions: 0, prompt: false, downloads: 0, private_button: false, inspector: None });
+        let plain = Layout::new(1600, 900, 1.0, SidebarMode::Pinned, 1.0, Counts { tabs: 2, favorites: 7, suggestions: 0, prompt: false, downloads: 0, private_button: false, inspector: None, pip_here: false });
         let f = plain.favorites[1];
         assert_eq!(plain.hit(f.x + 3.0, f.y + 3.0, false), Hit::Favorite(1));
         // … mit Vorschlägen liegen diese darüber und gewinnen.

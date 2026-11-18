@@ -33,6 +33,13 @@ pub fn style_main_window(window: &Window) {
     set(h, DWMWA_SYSTEMBACKDROP_TYPE as i32, DWMSBT_MAINWINDOW as i32);
 }
 
+/// Dunkler Rahmen und runde Ecken für das Bild-in-Bild-Fenster.
+pub fn style_pip_window(window: &Window) {
+    let Some(h) = hwnd(window) else { return };
+    set(h, DWMWA_USE_IMMERSIVE_DARK_MODE as i32, 1);
+    set(h, DWMWA_WINDOW_CORNER_PREFERENCE as i32, DWMWCP_ROUND as i32);
+}
+
 /// Holt den Tastaturfokus ins Hauptfenster zurück (z. B. aus einem WebView2-Tab, wenn man in die
 /// Adressleiste tippen will).
 pub fn take_focus(window: &Window) {

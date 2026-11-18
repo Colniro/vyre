@@ -85,7 +85,7 @@ pub struct EdgeRuntime {
     private: bool,
 }
 
-fn hwnd(window: &Window) -> HWND {
+pub(crate) fn hwnd(window: &Window) -> HWND {
     match window.window_handle().map(|h| h.as_raw()) {
         Ok(RawWindowHandle::Win32(h)) => HWND(h.hwnd.get() as *mut _),
         _ => HWND::default(),
@@ -101,6 +101,11 @@ impl EdgeRuntime {
     pub fn new(shared: Rc<EdgeShared>, dir: PathBuf, private: bool) -> Self {
         let parent = hwnd(&shared.main);
         Self { shared, env: Rc::new(RefCell::new(EnvState::None)), parent, dir, private }
+    }
+
+    /// Das Hauptfenster, in dem die WebView2-Tabs liegen.
+    pub fn parent(&self) -> HWND {
+        self.parent
     }
 
     pub fn failed(&self) -> bool {
@@ -298,6 +303,11 @@ fn setup(
                 let _ = p3.SetPreferredTrackingPreventionLevel(COREWEBVIEW2_TRACKING_PREVENTION_LEVEL_STRICT);
             }
         }
+        // Bild-in-Bild: Knopf über Videos und Bedienung im kleinen Fenster.
+        webview.AddScriptToExecuteOnDocumentCreated(
+            &HSTRING::from(crate::pip::PAGE_SCRIPT),
+            &AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(|_, _| Ok(()))),
+        )?;
         // Passwort-Skript: Vorschläge beim Klick in Login-Felder, Logins erkennen.
         webview.AddScriptToExecuteOnDocumentCreated(
             &HSTRING::from(crate::pwfill::PAGE_SCRIPT),
@@ -309,7 +319,10 @@ fn setup(
             &WebMessageReceivedEventHandler::create(Box::new(move |sender, args| {
                 let (Some(wv), Some(a)) = (sender, args) else { return Ok(()) };
                 let message = read(|p| a.TryGetWebMessageAsString(p));
-                if message.starts_with(crate::pwfill::PREFIX) || message.starts_with(crate::inspector::PREFIX) {
+                if message.starts_with(crate::pwfill::PREFIX)
+                    || message.starts_with(crate::inspector::PREFIX)
+                    || message.starts_with(crate::pip::PREFIX)
+                {
                     let page = read(|p| wv.Source(p));
                     sh.events.borrow_mut().push((id, EdgeEvent::Message(page, message)));
                     sh.main.request_redraw();
@@ -824,6 +837,20 @@ impl EdgeView {
         }
         if let Some(c) = self.inner.controller.borrow().as_ref() {
             let _ = unsafe { c.SetBounds(rect(bounds)) };
+        }
+    }
+
+    /// Zieht den Tab in ein anderes Fenster um (Bild-in-Bild und zurück) und zeigt ihn dort.
+    pub fn reparent(&self, parent: HWND, bounds: (i32, i32, u32, u32)) {
+        self.inner.bounds.set(bounds);
+        self.inner.visible.set(true);
+        if let Some(c) = self.inner.controller.borrow().as_ref() {
+            // SAFETY: gültige COM-Objekte und Fenster auf dem UI-Thread.
+            unsafe {
+                let _ = c.SetParentWindow(parent);
+                let _ = c.SetBounds(rect(bounds));
+                let _ = c.SetIsVisible(true);
+            }
         }
     }
 

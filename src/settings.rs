@@ -31,6 +31,9 @@ pub struct Settings {
     pub tiles: Vec<Tile>,
     /// Seiten ohne HTTPS, die man trotzdem öffnen wollte.
     pub http_allowed: Vec<String>,
+    /// Woher Updates kommen: leer = GitHub-Releases, `aus` = keine automatische Prüfung,
+    /// sonst eine Adresse oder ein Pfad zu einer update.json.
+    pub updates: String,
 }
 
 fn default_tiles() -> Vec<Tile> {
@@ -52,6 +55,7 @@ impl Default for Settings {
             search_engine: None,
             tiles: default_tiles(),
             http_allowed: Vec::new(),
+            updates: String::new(),
         }
     }
 }
@@ -100,6 +104,7 @@ impl Settings {
                         .filter(|h| !h.is_empty())
                         .collect();
                 }
+                "updates" => s.updates = value.to_string(),
                 "kacheln" => tiles_set = true,
                 "kachel" => {
                     if let Some((title, url)) = value.split_once('|') {
@@ -124,6 +129,8 @@ impl Settings {
         t += &format!("werbeblocker_aus = {}\n", self.adblock_off.join(", "));
         t += "# Seiten ohne HTTPS, die trotzdem geöffnet werden dürfen\n";
         t += &format!("http_erlaubt = {}\n", self.http_allowed.join(", "));
+        t += "# Updates: leer = GitHub, aus = nicht automatisch prüfen, sonst Adresse einer update.json\n";
+        t += &format!("updates = {}\n", self.updates);
         t += "# Kacheln der Neuer-Tab-Seite: kachel = Titel | Adresse\nkacheln = eigene\n";
         for tile in &self.tiles {
             t += &format!("kachel = {} | {}\n", tile.title.replace('|', "/"), tile.url);
@@ -193,6 +200,7 @@ mod tests {
             search_engine: Some("brave".into()),
             tiles: vec![Tile::new("A | B", "https://a.de/")],
             http_allowed: vec!["alt.de".into()],
+            updates: "aus".into(),
         };
         let back = Settings::parse(&s.to_text());
         assert_eq!(back.sidebar, SidebarMode::Hover);
@@ -200,6 +208,7 @@ mod tests {
         assert_eq!(back.search_engine.as_deref(), Some("brave"));
         assert_eq!(back.tiles, [Tile::new("A / B", "https://a.de/")]);
         assert_eq!(back.http_allowed, ["alt.de"]);
+        assert_eq!(back.updates, "aus");
     }
 
     #[test]

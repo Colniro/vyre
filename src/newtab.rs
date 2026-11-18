@@ -43,6 +43,8 @@ pub struct VyreProtocol {
     download_op: Option<Box<dyn Fn(u64, String) + Send + Sync>>,
     /// Privates Fenster: Hinweis auf der Neuer-Tab-Seite.
     private: bool,
+    /// "Nach Updates suchen" auf der Neuer-Tab-Seite.
+    update_check: Option<Box<dyn Fn() + Send + Sync>>,
     token: String,
 }
 
@@ -66,12 +68,18 @@ impl VyreProtocol {
             downloads: Some(downloads),
             download_op: Some(Box::new(download_op)),
             private: false,
+            update_check: None,
             token: format!("{a:016x}{:016x}", h.finish()) }
     }
 
     pub fn with_private(private: bool, mut me: Self) -> Self {
         me.private = private;
         me
+    }
+
+    pub fn with_update_check(mut self, check: impl Fn() + Send + Sync + 'static) -> Self {
+        self.update_check = Some(Box::new(check));
+        self
     }
 
     /// Erzeugt das HTML für eine `vyre://`-Adresse.
@@ -128,6 +136,12 @@ impl VyreProtocol {
                     _ => {}
                 }
                 return DOWNLOADS_URL.into();
+            }
+            "/update-pruefen" => {
+                if let Some(check) = &self.update_check {
+                    check();
+                }
+                return NEW_TAB_URL.into();
             }
             "/passwort-weg" => {
                 if let Some(id) = param("id").and_then(|i| i.parse().ok()) {
@@ -528,6 +542,7 @@ document.querySelectorAll(".actions button").forEach(function (b) {{
   <div class="tiles">{tiles}
     <div class="tile add"><a href="#" id="add"><span class="icon plus">+</span><span class="name">Hinzufügen</span></a></div>
   </div>
+  {version_line}
   <form id="addform" class="card hidden" autocomplete="off">
     <input id="addurl" placeholder="Adresse, z. B. servo.org">
     <input id="addtitle" placeholder="Name (optional)">
@@ -547,6 +562,8 @@ function go(path, params) {{
   var q = Object.keys(params).map(function (k) {{ return k + "=" + encodeURIComponent(params[k]); }}).join("&");
   location.replace("vyre://aktion/" + path + "?t=" + T + (q ? "&" + q : ""));
 }}
+var upd = document.getElementById("update");
+if (upd) upd.addEventListener("click", function (e) {{ e.preventDefault(); go("update-pruefen", {{}}); }});
 document.getElementById("search").addEventListener("submit", function (e) {{
   e.preventDefault();
   var q = document.getElementById("q").value.trim();
@@ -587,6 +604,14 @@ form.addEventListener("submit", function (e) {{
             },
             chooser_title = if first_start { "Willkommen bei Vyre! Welche Suchmaschine möchtest du nutzen?" } else { "Suchmaschine wählen" },
             token_js = crate::engine::js_string(token),
+            version_line = if self.private || self.update_check.is_none() {
+                String::new()
+            } else {
+                format!(
+                    r##"<div class="engine-line version">Vyre {} · <a href="#" id="update">Nach Updates suchen</a></div>"##,
+                    crate::update::CURRENT
+                )
+            },
         )
     }
 }
@@ -658,6 +683,7 @@ input { width: 100%; padding: 15px 20px; font-size: 17px; color: #e8e8f0; backgr
   border: 1.5px solid #2d2d3a; border-radius: 14px; outline: none; font-family: inherit; }
 input:focus { border-color: #9d8cff; background: #2d2d3a; }
 .engine-line { margin-top: 10px; font-size: 13px; color: #8a8a9c; }
+.engine-line.version { margin-top: 34px; font-size: 12px; opacity: .75; }
 a { color: #9d8cff; text-decoration: none; }
 .tiles { margin-top: 44px; display: flex; flex-wrap: wrap; justify-content: center; gap: 14px; }
 .tile { position: relative; width: 104px; }
@@ -739,6 +765,7 @@ mod tests {
             downloads: None,
             download_op: None,
             private: false,
+            update_check: None,
             token: "geheim".into(),
         }
     }

@@ -809,6 +809,15 @@ fn has_family(fs: &FontSystem, name: &str) -> bool {
         .any(|f| f.families.iter().any(|(fam, _)| fam.eq_ignore_ascii_case(name)))
 }
 
+/// Inhalt der Karte unter der Adressleiste; leere Knopftexte blenden den Knopf aus.
+#[derive(Clone, Copy, Debug)]
+pub struct Card<'a> {
+    pub title: &'a str,
+    pub detail: &'a str,
+    pub primary: &'a str,
+    pub secondary: &'a str,
+}
+
 /// Was die Oberfläche über die Tabs wissen muss.
 pub struct TabsView<'a> {
     pub tabs: &'a [PageState],
@@ -816,8 +825,8 @@ pub struct TabsView<'a> {
     pub favorites: &'a [Favorite],
     /// Ist die Seite im aktiven Tab angepinnt?
     pub is_favorite: bool,
-    /// Karte "Passwort speichern?": Seite und Benutzername.
-    pub save_prompt: Option<(&'a str, &'a str)>,
+    /// Karte unter der Adressleiste ("Passwort speichern?", "Vyre X ist da").
+    pub card: Option<Card<'a>>,
     /// Downloads für die Seitenleiste.
     pub downloads: &'a [crate::downloads::Entry],
 }
@@ -1073,8 +1082,8 @@ impl Ui {
             cards.push(RoundRect::new(ur.x + 9.0 * s, ur.y + ur.h - 3.0 * s, w, 2.0 * s, t.accent, 1.0 * s));
         }
 
-        // Karte "Passwort speichern?".
-        if let (Some(c), Some((host, user))) = (layout.pw_card, tabs.save_prompt) {
+        // Karte "Passwort speichern?" oder Update.
+        if let (Some(c), Some(card)) = (layout.pw_card, tabs.card) {
             cards.push(RoundRect::shadow(c.x, c.y, c.w, c.h, Rgba(0, 0, 0, 90), 10.0 * s, 6.0 * s));
             cards.push(RoundRect::new(c.x, c.y, c.w, c.h, t.surface, 10.0 * s));
             cards.push(RoundRect::outline(c.x, c.y, c.w, c.h, t.accent.with_alpha(150), 10.0 * s, 1.0 * s));
@@ -1082,17 +1091,20 @@ impl Ui {
             let na = self.anim(Hit::PwNever);
             let ca = self.anim(Hit::PwDismiss);
             let (b1, b2, b3) = (layout.pw_save, layout.pw_never, layout.pw_close);
-            cards.push(RoundRect::new(b1.x, b1.y, b1.w, b1.h, lerp(t.accent, Rgba::rgb(255, 255, 255), sa * 0.15), 8.0 * s));
-            cards.push(RoundRect::new(b2.x, b2.y, b2.w, b2.h, lerp(t.bg, t.hover, 0.5 + na * 0.5), 8.0 * s));
+            if !card.primary.is_empty() {
+                cards.push(RoundRect::new(b1.x, b1.y, b1.w, b1.h, lerp(t.accent, Rgba::rgb(255, 255, 255), sa * 0.15), 8.0 * s));
+            }
+            if !card.secondary.is_empty() {
+                cards.push(RoundRect::new(b2.x, b2.y, b2.w, b2.h, lerp(t.bg, t.hover, 0.5 + na * 0.5), 8.0 * s));
+            }
             if ca > 0.0 {
                 cards.push(RoundRect::new(b3.x, b3.y, b3.w, b3.h, t.hover.with_alpha((ca * 255.0) as u8), 6.0 * s));
             }
-            let who = if user.is_empty() { host.to_string() } else { format!("{user} · {host}") };
             let [title, detail, save, never, close] = &mut self.pw_labels;
-            title.set(fs, "Passwort speichern?", 13.0 * s, &self.ui_family, true);
-            detail.set(fs, &who, 11.5 * s, &self.ui_family, false);
-            save.set(fs, "Speichern", 12.5 * s, &self.ui_family, true);
-            never.set(fs, "Nie hier", 12.5 * s, &self.ui_family, false);
+            title.set(fs, card.title, 13.0 * s, &self.ui_family, true);
+            detail.set(fs, card.detail, 11.5 * s, &self.ui_family, false);
+            save.set(fs, card.primary, 12.5 * s, &self.ui_family, true);
+            never.set(fs, card.secondary, 12.5 * s, &self.ui_family, false);
             close.set(fs, ICON_CLOSE, 8.5 * s, &self.icon_family, false);
         }
 
@@ -1338,7 +1350,7 @@ impl Ui {
             let cr = Rect { x: r.x + r.w - 28.0 * s, y: r.y + 4.0 * s, w: 24.0 * s, h: 24.0 * s };
             text.push(centered(close, cr, t.dim));
         }
-        if let (Some(c), Some(_)) = (layout.pw_card, tabs.save_prompt) {
+        if let (Some(c), Some(card)) = (layout.pw_card, tabs.card) {
             let [title, detail, save, never, close] = &self.pw_labels;
             let clip = Some([c.x.max(0.0) as i32, c.y as i32, (c.x + c.w - 34.0 * s).max(0.0) as i32, (c.y + c.h) as i32]);
             text.push(TextBlock { buffer: &title.buffer, x: (c.x + 12.0 * s).round(), y: (c.y + 10.0 * s).round(), color: t.text, clip });
@@ -1349,8 +1361,12 @@ impl Ui {
                 color: t.dim,
                 clip,
             });
-            text.push(centered(save, layout.pw_save, t.bg));
-            text.push(centered(never, layout.pw_never, t.text));
+            if !card.primary.is_empty() {
+                text.push(centered(save, layout.pw_save, t.bg));
+            }
+            if !card.secondary.is_empty() {
+                text.push(centered(never, layout.pw_never, t.text));
+            }
             text.push(centered(close, layout.pw_close, t.dim));
         }
         if show_shield {

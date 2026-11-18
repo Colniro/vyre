@@ -3,7 +3,27 @@
 Ein schlanker Browser in Rust. Webseiten stellt [Servo](https://servo.org) dar, die Oberfläche
 wird mit wgpu selbst gezeichnet (Seitenleiste wie bei Zen, Funktionen nach dem Vorbild von Helium).
 
-## Starten
+## Installieren
+
+Den Installer `vyre-setup.exe` gibt es unter
+[Releases](https://github.com/Colniro/vyre/releases/latest). Er installiert Vyre ohne
+Adminrechte nach `%LOCALAPPDATA%\Programs\Vyre` und trägt auf Wunsch den Befehl `vyre` ein.
+
+## Updates
+
+Vyre schaut höchstens einmal am Tag beim Start in den GitHub-Releases nach einer neuen Version.
+Gibt es eine, erscheint in der Seitenleiste die Karte **„Vyre X ist da“**: *Aktualisieren* lädt
+den Installer, prüft seine SHA-256-Prüfsumme, installiert still und startet Vyre neu; *Später*
+fragt am nächsten Tag wieder. Sofort prüfen: **Nach Updates suchen** unten auf der
+Neuer-Tab-Seite oder `vyre update` im Terminal.
+
+In `einstellungen.txt` (`%LOCALAPPDATA%\Vyre`): `updates = aus` schaltet die automatische Prüfung
+ab, `updates = <adresse oder pfad zu update.json>` nimmt eine andere Quelle.
+
+Ein Release bauen: `powershell -File scripts\release.ps1 [-Notes "Was ist neu"] [-Publish]`
+(braucht Inno Setup 6; `-Publish` legt das Release mit `gh` an).
+
+## Starten (Entwicklung)
 
 ```
 cargo run --profile fast -- [adresse oder suchbegriff]
@@ -151,6 +171,7 @@ neuen Terminal (auch in Wyven):
 | `vyre tabs` | Offene Tabs auflisten (`*` = aktiv) |
 | `vyre reload` | Aktive Seite neu laden, z. B. nach dem Speichern |
 | `vyre konsole` | Konsole der aktiven Seite laufend anzeigen, farbig (Strg+C beendet) |
+| `vyre update` | Sofort nach einer neuen Version suchen |
 
 Startet man Vyre ein zweites Mal mit einer Adresse, öffnet sie sich als Tab im laufenden Fenster.
 
@@ -210,7 +231,8 @@ Filterlisten wie uBlock Origin: EasyList, EasyPrivacy, EasyList Germany, die uBO
   `einstellungen.txt` unter `werbeblocker_aus`).
 
 Die Listen liegen in `%LOCALAPPDATA%\Vyre\Filter` und werden höchstens einmal am Tag neu
-geladen. Das sind die einzigen Verbindungen, die Vyre von sich aus aufbaut.
+geladen. Das und die tägliche Update-Prüfung (siehe Updates) sind die einzigen Verbindungen,
+die Vyre von sich aus aufbaut.
 
 ## Aufbau
 
@@ -230,5 +252,13 @@ geladen. Das sind die einzigen Verbindungen, die Vyre von sich aus aufbaut.
 - `src/importer.rs`: Import aus Chrome/Edge/Brave, Firefox/Zen und CSV
 - `src/ipc.rs`: Steuerkanal (Named Pipe), `vyre`-Befehle, PATH-Eintrag
 - `src/settings.rs`: gespeicherte Einstellungen
+- `src/update.rs`: Update-Prüfung, Download mit Prüfsumme, Installer starten
+- `installer/vyre.iss`, `scripts/release.ps1`: Installer und Release
 - `src/render/`: GPU-Zeichnen (aus Wyven übernommen)
 - `src/keys.rs`, `src/win.rs`: Tastenübersetzung, Windows-11-Fenstereffekte
+
+## Lizenz
+
+Vyre steht unter MIT oder Apache-2.0, nach Wahl ([LICENSE-MIT](LICENSE-MIT),
+[LICENSE-APACHE](LICENSE-APACHE)). Servo und weitere Bibliotheken haben eigene Lizenzen
+(Servo: MPL-2.0).

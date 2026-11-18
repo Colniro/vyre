@@ -5,6 +5,7 @@
 //! - `vyre tabs` listet die offenen Tabs.
 //! - `vyre reload` lädt die aktive Seite neu.
 //! - `vyre konsole` zeigt laufend die Konsole der aktiven Seite (Strg+C beendet).
+//! - `vyre update` sucht sofort nach einer neuen Version.
 //!
 //! Protokoll: eine JSON-Zeile vom Client, danach Antwortzeilen (Text) vom Server.
 
@@ -24,6 +25,7 @@ pub enum Request {
     Tabs,
     Reload,
     Console,
+    Update,
 }
 
 impl Request {
@@ -33,6 +35,7 @@ impl Request {
             Request::Tabs => json!({ "cmd": "tabs" }),
             Request::Reload => json!({ "cmd": "reload" }),
             Request::Console => json!({ "cmd": "konsole" }),
+            Request::Update => json!({ "cmd": "update" }),
         }
     }
 
@@ -49,6 +52,7 @@ impl Request {
             "tabs" => Request::Tabs,
             "reload" => Request::Reload,
             "konsole" => Request::Console,
+            "update" => Request::Update,
             _ => return None,
         })
     }
@@ -77,6 +81,7 @@ pub fn parse_args(args: &[String]) -> Option<Request> {
         "tabs" => Some(Request::Tabs),
         "reload" => Some(Request::Reload),
         "konsole" | "console" => Some(Request::Console),
+        "update" | "aktualisieren" => Some(Request::Update),
         _ => None,
     }
 }
@@ -160,6 +165,31 @@ fn handle(pipe: File, deliver: impl Fn(Incoming)) {
     }
 }
 
+/// Ein Build aus dem Projektordner (`…\target\fast` usw.)?
+fn is_dev_dir(dir: &str) -> bool {
+    dir.to_ascii_lowercase().replace('/', "\\").contains("\\target\\")
+}
+
+/// Der neue Benutzer-PATH mit `dir`, oder `None`, wenn nichts zu ändern ist.
+/// Ein installiertes Vyre geht vor: Es nimmt Entwicklungs-Builds aus dem PATH, und ein
+/// Entwicklungs-Build trägt sich nicht ein, wenn schon ein installiertes Vyre im PATH ist.
+fn updated_path(current: &str, dir: &str, has_vyre: impl Fn(&str) -> bool) -> Option<String> {
+    let same = |p: &str| p.trim().trim_end_matches('\\').eq_ignore_ascii_case(dir.trim_end_matches('\\'));
+    let entries: Vec<&str> = current.split(';').filter(|p| !p.trim().is_empty()).collect();
+    let mut kept: Vec<&str> = if is_dev_dir(dir) {
+        if entries.iter().any(|p| same(p) || (!is_dev_dir(p) && has_vyre(p.trim()))) {
+            return None;
+        }
+        entries.clone()
+    } else {
+        entries.iter().copied().filter(|p| same(p) || !(is_dev_dir(p) && has_vyre(p.trim()))).collect()
+    };
+    if !kept.iter().any(|p| same(p)) {
+        kept.push(dir);
+    }
+    (kept != entries).then(|| kept.join(";"))
+}
+
 /// Trägt den Ordner von vyre.exe in den Benutzer-PATH ein (einmalig, ohne Adminrechte),
 /// damit `vyre` in jedem neuen Terminal funktioniert. Liefert `true`, wenn neu eingetragen.
 pub fn ensure_in_path() -> bool {
@@ -189,12 +219,10 @@ pub fn ensure_in_path() -> bool {
         } else {
             String::new()
         };
-        let already = current.split(';').any(|p| p.trim().trim_end_matches('\\').eq_ignore_ascii_case(dir.trim_end_matches('\\')));
-        if already {
+        let Some(new) = updated_path(&current, &dir, |d| std::path::Path::new(d).join("vyre.exe").is_file()) else {
             RegCloseKey(key);
             return false;
-        }
-        let new = if current.trim().is_empty() { dir.clone() } else { format!("{};{dir}", current.trim_end_matches(';')) };
+        };
         let data = wide(&new);
         let ok = RegSetValueExW(key, value_name.as_ptr(), 0, REG_EXPAND_SZ, data.as_ptr() as *const u8, (data.len() * 2) as u32) == 0;
         RegCloseKey(key);
@@ -218,6 +246,22 @@ mod tests {
     }
 
     #[test]
+    fn installiertes_vyre_geht_im_path_vor() {
+        let dev = r"C:\P\Vyre\target\fast";
+        let inst = r"C:\U\AppData\Local\Programs\Vyre";
+        let all = |d: &str| d != r"C:\Tools";
+        // Erster Start eines Builds: eintragen.
+        assert_eq!(updated_path(r"C:\Tools", dev, all).as_deref(), Some(r"C:\Tools;C:\P\Vyre\target\fast"));
+        // Installiert: den Entwicklungs-Build verdrängen.
+        let p = format!(r"C:\Tools;{dev}");
+        assert_eq!(updated_path(&p, inst, all), Some(format!(r"C:\Tools;{inst}")));
+        // Entwicklungs-Build neben installiertem: nichts ändern.
+        assert_eq!(updated_path(&format!(r"C:\Tools;{inst}"), dev, all), None);
+        // Schon eingetragen: nichts ändern.
+        assert_eq!(updated_path(&format!(r"C:\Tools;{inst}\"), inst, all), None);
+    }
+
+    #[test]
     fn befehlszeile() {
         assert_eq!(parse_args(&a(&["tabs"])), Some(Request::Tabs));
         assert_eq!(parse_args(&a(&["konsole"])), Some(Request::Console));
@@ -237,6 +281,7 @@ mod tests {
             Request::Tabs,
             Request::Reload,
             Request::Console,
+            Request::Update,
         ] {
             assert_eq!(Request::from_json(&r.to_json()), Some(r));
         }

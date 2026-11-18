@@ -1,8 +1,8 @@
 [package]
 name = "vyre"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
-license = "MPL-2.0"
+license = "MIT OR Apache-2.0"
 rust-version = "1.90"
 description = "Vyre - ein schlanker Browser in Rust auf Basis von Servo"
 

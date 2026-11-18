@@ -22,6 +22,7 @@ mod session;
 mod sites;
 mod settings;
 mod ui;
+mod update;
 mod vault;
 #[cfg(windows)]
 mod win;
@@ -54,6 +55,37 @@ pub enum UserEvent {
     Ipc(ipc::Incoming),
     /// Pausieren/Fortsetzen/Abbrechen auf vyre://downloads (für WebView2-Downloads im Hauptthread).
     DownloadOp(u64, String),
+    /// "Nach Updates suchen" auf der Neuer-Tab-Seite.
+    CheckUpdate,
+    /// Ergebnis der Update-Prüfung oder des Downloads.
+    Update(update::Event),
+}
+
+/// Was die Update-Karte in der Seitenleiste zeigt.
+#[derive(Debug)]
+enum UpdateCard {
+    Checking,
+    Offer(update::Manifest),
+    Downloading(String),
+    Latest,
+    Failed(String),
+}
+
+impl UpdateCard {
+    /// Titel, Zeile darunter, Knöpfe (leer: kein Knopf).
+    fn texts(&self) -> (String, String, &'static str, &'static str) {
+        let current = update::CURRENT;
+        match self {
+            UpdateCard::Checking => ("Suche nach Updates …".into(), format!("Vyre {current}"), "", ""),
+            UpdateCard::Offer(m) => {
+                let note = m.notes.lines().map(str::trim).find(|l| !l.is_empty()).map(str::to_string);
+                (format!("Vyre {} ist da", m.version), note.unwrap_or_else(|| format!("Du hast {current}")), "Aktualisieren", "Später")
+            }
+            UpdateCard::Downloading(v) => (format!("Vyre {v} wird geladen …"), "Danach startet Vyre neu".into(), "", ""),
+            UpdateCard::Latest => ("Vyre ist aktuell".into(), format!("Version {current}"), "", ""),
+            UpdateCard::Failed(e) => ("Update fehlgeschlagen".into(), e.clone(), "", ""),
+        }
+    }
 }
 
 /// So oft wird die FPS-Anzeige auch ohne andere Änderungen aufgefrischt.
@@ -173,6 +205,11 @@ struct Browser {
     console_subscribers: Vec<std::sync::mpsc::Sender<String>>,
     /// Abgeschicktes Login, das noch auf "Speichern?" wartet: Seite, Benutzername, Passwort.
     pending_save: Option<(String, String, String)>,
+    /// Karte zum Update (Angebot, Laden, Ergebnis einer Prüfung von Hand).
+    update_card: Option<UpdateCard>,
+    /// `vyre update` wartet auf das Ergebnis.
+    update_reply: Option<std::sync::mpsc::Sender<String>>,
+    update_proxy: EventLoopProxy<UserEvent>,
     /// Angepinnte Favoriten (Kopie aus der Datenbank, bei Änderungen neu gelesen).
     favorites: Vec<history::Favorite>,
     /// Zuletzt gespeicherte Sitzung, damit nur bei Änderungen geschrieben wird.
@@ -204,6 +241,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(area) = self.beside {
                     b.place_beside(area);
                 }
+                b.auto_update_check();
                 self.browser = Some(b);
             }
             Err(e) => {
@@ -222,6 +260,8 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::DownloadsChanged => b.window.request_redraw(),
             UserEvent::Ipc(incoming) => b.handle_ipc(incoming),
             UserEvent::DownloadOp(id, op) => b.engine.download_control(id, &op),
+            UserEvent::CheckUpdate => b.manual_update_check(),
+            UserEvent::Update(e) => b.on_update(event_loop, e),
         }
     }
 
@@ -347,9 +387,15 @@ impl Browser {
                     let _ = proxy.send_event(UserEvent::DownloadOp(id, op));
                 }
             },
-        ))) {
+        )).with_update_check({
+            let proxy = proxy.clone();
+            move || {
+                let _ = proxy.send_event(UserEvent::CheckUpdate);
+            }
+        })) {
             log::error!("vyre:// nicht registriert: {e:?}");
         }
+        let update_proxy = proxy.clone();
         let t = Instant::now();
         let mut engine = ServoEngine::new(
             event_loop,
@@ -390,6 +436,9 @@ impl Browser {
             downloads,
             console_subscribers: Vec::new(),
             pending_save: None,
+            update_card: None,
+            update_reply: None,
+            update_proxy,
             saved_session: restore,
             keep_session,
             modifiers: ModifiersState::empty(),
@@ -559,7 +608,7 @@ impl Browser {
                 tabs: self.engine.tabs().len(),
                 favorites: self.favorites.len(),
                 suggestions: if self.ui.url_focused { self.ui.suggestions.len() } else { 0 },
-                prompt: self.pending_save.is_some(),
+                prompt: self.pending_save.is_some() || self.update_card.is_some(),
                 downloads: self.downloads.sidebar().len(),
                 private_button: !self.ui.private,
             },
@@ -762,9 +811,102 @@ impl Browser {
                 self.engine.reload();
                 let _ = reply.send(format!("Neu geladen: {}", ui::tab_title(&self.engine.state())));
             }
+            ipc::Request::Update => {
+                let _ = reply.send(format!("Vyre {} – suche nach Updates …", update::CURRENT));
+                self.update_reply = Some(reply);
+                self.manual_update_check();
+            }
             ipc::Request::Console => {
                 let _ = reply.send(format!("Konsole von „{}“ – Strg+C beendet", ui::tab_title(&self.engine.state())));
                 self.console_subscribers.push(reply);
+            }
+        }
+    }
+
+    /// Woher Updates kommen (einstellungen.txt, sonst GitHub) und ob automatisch geprüft wird.
+    fn update_source(&self) -> (String, bool) {
+        let value = self.settings.get().updates.trim().to_string();
+        match value.as_str() {
+            "aus" | "off" => (update::OFFICIAL.into(), false),
+            "" => (update::OFFICIAL.into(), true),
+            _ => (value, true),
+        }
+    }
+
+    fn update_sender(&self) -> impl FnOnce(update::Event) + Send + 'static {
+        let proxy = self.update_proxy.clone();
+        move |e| {
+            let _ = proxy.send_event(UserEvent::Update(e));
+        }
+    }
+
+    /// Einmal am Tag beim Start (nicht im privaten Fenster); still, solange nichts Neues da ist.
+    fn auto_update_check(&self) {
+        let (source, auto) = self.update_source();
+        if auto && !self.ui.private && update::due() {
+            update::check(source, false, self.update_sender());
+        }
+    }
+
+    /// Sofort prüfen (Neuer-Tab-Seite, `vyre update`); das Ergebnis zeigt die Karte.
+    fn manual_update_check(&mut self) {
+        if matches!(self.update_card, Some(UpdateCard::Checking | UpdateCard::Downloading(_))) {
+            return;
+        }
+        self.set_update_card(Some(UpdateCard::Checking));
+        let (source, _) = self.update_source();
+        update::check(source, true, self.update_sender());
+    }
+
+    fn set_update_card(&mut self, card: Option<UpdateCard>) {
+        self.update_card = card;
+        self.relayout();
+    }
+
+    /// Antwort an ein wartendes `vyre update`.
+    fn reply_update(&mut self, text: String) {
+        if let Some(reply) = self.update_reply.take() {
+            let _ = reply.send(text);
+        }
+    }
+
+    /// "Aktualisieren": Installer laden und prüfen (danach `on_update` mit `Ready`).
+    fn update_accept(&mut self) {
+        let Some(UpdateCard::Offer(m)) = &self.update_card else { return };
+        let m = m.clone();
+        let (source, _) = self.update_source();
+        self.set_update_card(Some(UpdateCard::Downloading(m.version.clone())));
+        update::download(source, m, self.update_sender());
+    }
+
+    fn on_update(&mut self, event_loop: &ActiveEventLoop, event: update::Event) {
+        match event {
+            update::Event::Checked { found: Some(m), .. } => {
+                log::info!("Update verfügbar: Vyre {}", m.version);
+                self.reply_update(format!("Vyre {} ist da – „Aktualisieren“ in der Seitenleiste installiert es", m.version));
+                self.set_update_card(Some(UpdateCard::Offer(m)));
+            }
+            update::Event::Checked { found: None, manual } => {
+                self.reply_update(format!("Vyre ist aktuell ({})", update::CURRENT));
+                if manual {
+                    self.set_update_card(Some(UpdateCard::Latest));
+                }
+            }
+            update::Event::Ready(path) => match update::run_installer(&path) {
+                // Der Installer ersetzt vyre.exe und startet Vyre danach wieder.
+                Ok(()) => {
+                    log::info!("Installer gestartet: {}", path.display());
+                    event_loop.exit();
+                }
+                Err(e) => self.set_update_card(Some(UpdateCard::Failed(e))),
+            },
+            update::Event::Failed(e) => {
+                log::warn!("Update: {e}");
+                self.reply_update(format!("Update: {e}"));
+                // Scheitert die automatische Prüfung (z. B. offline), bleibt es still.
+                if self.update_card.is_some() {
+                    self.set_update_card(Some(UpdateCard::Failed(e)));
+                }
             }
         }
     }
@@ -1054,6 +1196,9 @@ impl Browser {
             Hit::Shield => self.toggle_adblock(),
             Hit::Tab(i) => self.select_tab(i),
             Hit::Star => self.toggle_favorite(),
+            // Ohne Passwort-Karte gehören die Knöpfe zur Update-Karte.
+            Hit::PwSave if self.pending_save.is_none() => self.update_accept(),
+            Hit::PwNever | Hit::PwDismiss if self.pending_save.is_none() => self.set_update_card(None),
             Hit::PwSave => {
                 if let Some((origin, user, pass)) = self.pending_save.take() {
                     if self.vault.save(&origin, &user, &pass) {
@@ -1251,16 +1396,21 @@ impl Browser {
         if sidebar_downloads.len() != self.layout.downloads.len() {
             self.relayout();
         }
-        let prompt_host = self
-            .pending_save
-            .as_ref()
-            .map(|(o, u, _)| (o.split("://").nth(1).unwrap_or(o).to_string(), u.clone()));
+        // Die Passwort-Karte geht vor; sonst die Update-Karte.
+        let card_text = match &self.pending_save {
+            Some((origin, user, _)) => {
+                let host = origin.split("://").nth(1).unwrap_or(origin);
+                let who = if user.is_empty() { host.to_string() } else { format!("{user} · {host}") };
+                Some(("Passwort speichern?".to_string(), who, "Speichern", "Nie hier"))
+            }
+            None => self.update_card.as_ref().map(UpdateCard::texts),
+        };
         let view = TabsView {
             tabs: &tabs,
             active,
             favorites: &self.favorites,
             is_favorite,
-            save_prompt: prompt_host.as_ref().map(|(h, u)| (h.as_str(), u.as_str())),
+            card: card_text.as_ref().map(|(title, detail, primary, secondary)| ui::Card { title, detail, primary, secondary }),
             downloads: &sidebar_downloads,
         };
         let background = self.ui.theme().bg;
@@ -1341,6 +1491,30 @@ fn run_command(request: ipc::Request) -> i32 {
                         eprintln!("Vyre konnte nicht gestartet werden: {e}");
                         1
                     }
+                }
+            }
+            // Ohne laufendes Vyre: nur nachsehen und Bescheid sagen.
+            ipc::Request::Update => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let source = settings::Settings::load().updates.trim().to_string();
+                let source = if source.is_empty() || source == "aus" || source == "off" { update::OFFICIAL.to_string() } else { source };
+                update::check(source, true, move |e| {
+                    let _ = tx.send(e);
+                });
+                match rx.recv() {
+                    Ok(update::Event::Checked { found: Some(m), .. }) => {
+                        println!("Vyre {} ist da (du hast {}). Starte Vyre und klicke „Aktualisieren“ in der Seitenleiste.", m.version, update::CURRENT);
+                        0
+                    }
+                    Ok(update::Event::Checked { found: None, .. }) => {
+                        println!("Vyre ist aktuell ({})", update::CURRENT);
+                        0
+                    }
+                    Ok(update::Event::Failed(e)) => {
+                        eprintln!("Update-Prüfung fehlgeschlagen: {e}");
+                        1
+                    }
+                    _ => 1,
                 }
             }
             _ => {
